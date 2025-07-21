@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from torchmetrics.functional.classification.accuracy import accuracy
 from .loss import concepts_cost, concepts_sparsity_cost, spatial_concepts_cost
 import ctc
-
+import numpy as np
 
 class CTCModel(pl.LightningModule):
     def __init__(

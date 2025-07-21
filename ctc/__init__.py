@@ -5,6 +5,7 @@ from .vit import imagenet_vit_small, imagenet_cvit_small, imagenet_slotcvit_smal
 from .swin import cub_slotcswin_sa, cub_slotcswin_isa, cub_slotcswin_qsa
 from .convnext import cub_slotc_convnext_sa, cub_slotc_convnext_isa, cub_slotc_convnext_qsa
 from .ctc_model import CTCModel, load_exp, run_exp
+from .vit import embryo_slotcvit_sa
 
 __all__ = [
     # basic modules to execute models.
@@ -41,4 +42,7 @@ __all__ = [
     "imagenet_slotcvit_small_sa",
     "imagenet_slotcvit_small_isa",
     "imagenet_slotcvit_small_qsa",
+
+    # embryo
+    "embryo_slotcvit_sa",
 ]

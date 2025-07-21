@@ -3,6 +3,7 @@ import timm
 import torch
 from timm.models.vision_transformer import VisionTransformer
 from torch import nn
+from ctc.model_utils import register
 from ctc.model_utils import ConceptSlotAttention, CrossAttention, ConceptQuerySlotAttention, ConceptISA
 
 
@@ -87,6 +88,21 @@ def cifar100superclass_slotcvit_qsa(backbone_name='vit_tiny_patch16_224', *args,
         **kwargs,
     )
 
+# For Embryo
+@register("embryo_slotcvit_sa")        # ← 실행 시 --model 에서 쓰는 이름
+def embryo_slotcvit_sa(backbone_name="vit_tiny_patch16_224", *args, **kwargs):
+    return SlotCVITSA(                 # 기존 클래스 재사용
+        model_name=backbone_name,
+        num_classes=2,                 # ★★ 2-클래스 헤드 ★★
+        n_unsup_concepts=4,           # 필요 없으면 0
+        n_concepts=0,                  # 개념 토큰 안 쓸 거면 0
+        n_spatial_concepts=0,          # 공간 개념 안 쓰면 0
+        num_heads=12,
+        attention_dropout=0.1,
+        projection_dropout=0.1,
+        *args,
+        **kwargs,
+    )
 
 # For CUB
 def cub_cvit(backbone_name="vit_large_patch16_224", baseline=False, *args, **kwargs):
@@ -408,7 +424,7 @@ class ConceptTransformerVIT(nn.Module):
 
         out = 0.0
         if self.n_unsup_concepts > 0:  # unsupervised stream
-            out_unsup, unsup_concept_attn = self.concept_tranformer(x_cls, self.unsup_concepts)
+            out_unsup, unsup_concept_attn = self.unsup_concept_tranformer(x_cls, self.unsup_concepts)
             unsup_concept_attn = unsup_concept_attn.mean(1)  # average over heads
             out = out + out_unsup.squeeze(1)  # squeeze token dimension
 
@@ -501,7 +517,7 @@ class ConceptCentricTransformerVITSA(nn.Module):
         if self.n_unsup_concepts > 0:  # unsupervised stream
             unsup_concepts, unsup_concepts_slot_attn = self.unsup_concept_slot_attention(x_cls)
             unsup_concepts += self.unsup_concept_slot_pos.view(-1, self.n_unsup_concepts, self.embedding_dim)
-            out_unsup, unsup_concept_attn = self.concept_tranformer(x_cls, unsup_concepts)
+            out_unsup, unsup_concept_attn = self.unsup_concept_tranformer(x_cls, unsup_concepts)
             unsup_concept_attn = unsup_concept_attn.mean(1)  # average over heads
             out = out + out_unsup.squeeze(1)  # squeeze token dimension
 
