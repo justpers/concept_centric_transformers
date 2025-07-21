@@ -93,7 +93,7 @@ def cifar100superclass_slotcvit_qsa(backbone_name='vit_tiny_patch16_224', *args,
 def embryo_slotcvit_sa(backbone_name="vit_tiny_patch16_224", *args, **kwargs):
     return SlotCVITSA(                 # 기존 클래스 재사용
         model_name=backbone_name,
-        num_classes=2,                 # ★★ 2-클래스 헤드 ★★
+        num_classes=2,                 # 2-클래스 헤드
         n_unsup_concepts=4,           # 필요 없으면 0
         n_concepts=0,                  # 개념 토큰 안 쓸 거면 0
         n_spatial_concepts=0,          # 공간 개념 안 쓰면 0

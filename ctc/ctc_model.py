@@ -12,6 +12,31 @@ from .loss import concepts_cost, concepts_sparsity_cost, spatial_concepts_cost
 import ctc
 import numpy as np
 
+
+def _unsup_slot_losses(attn,  # [B, C, N]
+                    λ_sparse: float,
+                    λ_div: float):
+    """
+    • sparsity  : 슬롯-별 엔트로피 ↓
+    • diversity : 슬롯 간 토큰 중복 ↓
+    반환: (loss_total, loss_sparse, loss_div)
+    """
+    if attn is None:
+        zero = torch.tensor(0., device='cuda' if torch.cuda.is_available() else 'cpu')
+        return zero, zero, zero
+
+    p = attn.clamp_min(1e-8)            # 안전 log
+    entropy = -(p * p.log()).sum(-1).mean()          # [B,C] → 평균
+    sparsity = entropy                                  # 값이 작아야 좋음
+
+    # 슬롯 간 유사도(=겹침) : off-diag dot-product
+    sim = torch.einsum('bcn,bdn->bcd', p, p)            # [B,C,C]
+    C = sim.size(-1)
+    eye = torch.eye(C, device=sim.device)
+    diversity = (sim * (1 - eye)).mean()               # 작아야 좋음
+
+    total = λ_sparse * sparsity + λ_div * diversity
+    return total, sparsity, diversity
 class CTCModel(pl.LightningModule):
     def __init__(
             self,
@@ -80,6 +105,7 @@ class CTCModel(pl.LightningModule):
             acc,
             expl_loss,
             l1_loss,
+            sparse_loss, div_loss,   # 수정
             _, _, _
         ) = self.shared_step(batch, task=self.task, num_classes=self.num_classes)
         loss = ce_loss
@@ -111,8 +137,11 @@ class CTCModel(pl.LightningModule):
             acc,
             expl_loss,
             l1_loss,
-            _, _, _
+            _, _, unsup_concept_attn,   # 수정
+            _, _
         ) = self.shared_step(batch, task=self.task, num_classes=self.num_classes)
+        # if batch_idx == 0:
+        #     attn_map = unsup_concept_attn[0].detach().cpu()
         self.log_dict(
             {
                 "val_ce_loss": ce_loss,
@@ -177,17 +206,64 @@ class CTCModel(pl.LightningModule):
             "spatial_concept_attn": spatial_concept_attn,
             "spatial_expl": spatial_expl,
         }
-
+    
     def shared_step(self, batch, task='binary', num_classes=None):
-        x, expl, spatial_expl, y = batch
+        """
+        배치 형태
+        ── (a) 기존 CCT :  (image, expl, spatial_expl, label)
+        ── (b) 슬롯 전용 : (image, label)
+        """
+        # ----------------------------- 1. unpack
+        if len(batch) == 4:          # (a) supervised-concept
+            x, expl, spatial_expl, y = batch
+        elif len(batch) == 2:        # (b) only img/label
+            x, y = batch
+            expl = spatial_expl = None
+        else:
+            raise ValueError(f"Unexpected batch len={len(batch)}")
+
+        # ----------------------------- 2. forward
         logits, unsup_concept_attn, concept_attn, spatial_concept_attn = self(x)
-        preds = torch.argmax(logits, dim=1)
+        preds = torch.argmax(logits, dim=-1)
 
+        # ----------------------------- 3. 기본 cross-entropy & acc
         ce_loss = F.nll_loss(logits, y)
-        acc = accuracy(preds, y, task=task, num_classes=num_classes)
-        expl_loss = concepts_cost(concept_attn, expl) + spatial_concepts_cost(spatial_concept_attn, spatial_expl)
-        l1_loss = concepts_sparsity_cost(concept_attn, spatial_concept_attn)
+        acc     = accuracy(preds, y, task=task, num_classes=num_classes)
 
+        # ----------------------------- 4. supervised concept-loss (옵션)
+        expl_loss = l1_loss = torch.tensor(0., device=logits.device)
+        if expl is not None and concept_attn is not None:
+            expl_loss = (concepts_cost(concept_attn, expl) +
+                        spatial_concepts_cost(spatial_concept_attn, spatial_expl))
+            l1_loss   = concepts_sparsity_cost(concept_attn, spatial_concept_attn)
+
+        # ----------------------------- 5. unsupervised slot losses
+        λ_sparse = getattr(self.hparams, "lambda_unsup_sparse", 0.0)
+        λ_div    = getattr(self.hparams, "lambda_unsup_div",    0.0)
+        unsup_loss, sparse_loss, div_loss = _unsup_slot_losses(
+            unsup_concept_attn, λ_sparse, λ_div
+        )
+
+        # ----------------------------- 6. total loss
+        total_loss = (
+            ce_loss +
+            self.hparams.expl_lambda * (expl_loss + l1_loss) +
+            unsup_loss
+        )
+
+        # ----------------------------- 7. logging
+        self.log_dict(
+            {
+                "loss": total_loss,
+                "ce": ce_loss,
+                "acc": acc,
+                "expl": expl_loss,
+                "l1": l1_loss,
+                "unsup_sparse": sparse_loss,
+                "unsup_div": div_loss,
+            },
+            prog_bar=True, on_step=False, on_epoch=True, sync_dist=True,
+        )
         return (
             logits,
             preds,
@@ -195,6 +271,8 @@ class CTCModel(pl.LightningModule):
             acc,
             expl_loss,
             l1_loss,
+            sparse_loss,
+            div_loss,
             unsup_concept_attn,
             concept_attn,
             spatial_concept_attn,

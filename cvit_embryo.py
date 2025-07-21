@@ -15,7 +15,7 @@ def get_parser(parser):
     parser.add_argument("--batch_size",     default=8,     type=int)
     parser.add_argument("--max_epochs",     default=40,    type=int)
     parser.add_argument("--weight_decay",   default=1e-3,  type=float)
-    parser.add_argument("--expl_lambda",    default=0.0,   type=float)   # 개념 Loss OFF
+    parser.add_argument("--expl_lambda",    default=0.0,   type=float)
     parser.add_argument("--finetune_unfreeze_epoch", default=0, type=int)
     parser.add_argument("--disable_lr_scheduler",  action="store_true")
     parser.add_argument("--data_dir",       default="~/embryo_vit224/", type=str)
@@ -29,6 +29,10 @@ def get_parser(parser):
                         type=str, help="ViT-Tiny + SA (2-class)")
     parser.add_argument("--no_cuda",        action="store_true")
     parser.add_argument("--gpu",            default=0, type=int)
+
+    # 무감독 개념 슬롯 학습 파라미터 추가
+    parser.add_argument("--lambda_unsup_sparse", default=0.5, type=float)
+    parser.add_argument("--lambda_unsup_div",    default=0.5, type=float)
     return parser
 
 def main():
