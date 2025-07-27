@@ -10,7 +10,7 @@ scikit-learn==1.4.2
 scipy==1.13.0
 scikit-image==0.23.2
 timm==0.9.12
-torch==2.3.0+cu121
+torch==2.3.0
 torchmetrics==0.11.4
-torchvision==0.18.0+cu121
+torchvision==0.18.0
 tqdm==4.66.4
