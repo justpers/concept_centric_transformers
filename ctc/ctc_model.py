@@ -164,6 +164,8 @@ class CTCModel(pl.LightningModule):
             acc,
             expl_loss,
             l1_loss,
+            sparse_loss,
+            div_loss,
             _, _, _
         ) = self.shared_step(batch, task=self.task, num_classes=self.num_classes)
         self.log_dict(
@@ -188,6 +190,7 @@ class CTCModel(pl.LightningModule):
             acc,
             expl_loss,
             l1_loss,
+            _, _,
             unsup_concept_attn,
             concept_attn,
             spatial_concept_attn,
