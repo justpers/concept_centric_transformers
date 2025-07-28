@@ -139,12 +139,15 @@ venv.bak/
 # mkdocs documentation
 /site
 
-# mypy
+# 
 .mypy_cache/
 .dmypy.json
 dmypy.json
 *.png
 logs/
+*.BMP
+embryo_slotcvit_sa/
+*.xlsx
 
 # Pyre type checker
 .pyre/
