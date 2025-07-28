@@ -25,18 +25,19 @@ def _unsup_slot_losses(attn,  # [B, C, N]
         zero = torch.tensor(0., device='cuda' if torch.cuda.is_available() else 'cpu')
         return zero, zero, zero
 
+    C = attn.size(1)
     p = attn.clamp_min(1e-8)            # 안전 log
     entropy = -(p * p.log()).sum(-1).mean()          # [B,C] → 평균
-    sparsity = entropy                                  # 값이 작아야 좋음
+    sparsity = entropy / torch.log(torch.tensor(C, device=attn.device, dtype=p.dtype))       # 값이 작아야 좋음
 
     # 슬롯 간 유사도(=겹침) : off-diag dot-product
     sim = torch.einsum('bcn,bdn->bcd', p, p)            # [B,C,C]
-    C = sim.size(-1)
     eye = torch.eye(C, device=sim.device)
     diversity = (sim * (1 - eye)).mean()               # 작아야 좋음
 
     total = λ_sparse * sparsity + λ_div * diversity
     return total, sparsity, diversity
+
 class CTCModel(pl.LightningModule):
     def __init__(
             self,
@@ -49,6 +50,8 @@ class CTCModel(pl.LightningModule):
             max_epochs,
             attention_sparsity,
             task,
+            lambda_unsup_sparse=0.0,
+            lambda_unsup_div=0.0,
             **kwargs,
     ):
 
@@ -108,11 +111,13 @@ class CTCModel(pl.LightningModule):
             sparse_loss, div_loss,   # 수정
             _, _, _
         ) = self.shared_step(batch, task=self.task, num_classes=self.num_classes)
-        loss = ce_loss
+        loss  = ce_loss
         if self.hparams.expl_lambda > 0:
             loss = loss + self.hparams.expl_lambda * expl_loss
         if self.hparams.attention_sparsity > 0:
             loss = loss + self.hparams.attention_sparsity * l1_loss
+        if self.hparams.lambda_unsup_sparse > 0:
+            loss = loss + self.hparams.lambda_unsup_div * div_loss + self.hparams.lambda_unsup_sparse * sparse_loss
 
         self.log_dict(
             {
@@ -121,6 +126,8 @@ class CTCModel(pl.LightningModule):
                 "train_acc": acc,
                 "train_expl_loss": expl_loss,
                 "train_l1_loss": l1_loss,
+                "train_sparse_loss": sparse_loss,
+                "train_div_loss": div_loss
             },
             on_step=False,
             on_epoch=True,
@@ -375,7 +382,7 @@ def get_trainer(max_epochs, logger, callbacks, args, debug=False):
         else:
             trainer = pl.Trainer(
                 logger=logger,
-                max_epochsd=max_epochs,
+                max_epochs=max_epochs,
                 callbacks=callbacks,
                 accelerator="cpu",
                 precision=16
