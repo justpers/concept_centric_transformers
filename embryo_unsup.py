@@ -11,15 +11,18 @@ Tested with torch 2.3 / pytorch‑lightning 1.9; modify paths & hyper‑para
 from __future__ import annotations
 import argparse, os, glob
 from typing import List, Tuple
-
+import warnings
+warnings.filterwarnings("ignore")
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch
+import sys
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 import torchmetrics
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+torch.set_float32_matmul_precision('medium')
 
 # ────────────────────────────────────────────────────────────
 # 1. Dataset & DataModule
@@ -49,22 +52,31 @@ class EmbryoDataset(Dataset):
 
 
 def default_transforms(img_size: int = 224, is_train: bool = True):
+    base = [
+        A.LongestMaxSize(max_size=max(img_size, 256)),
+        A.PadIfNeeded(
+            min_height=img_size,
+            min_width=img_size,
+            border_mode=0,
+            value=0,                       # <─ 추가
+        ),
+    ]
     if is_train:
-        return A.Compose([
-            A.LongestMaxSize(max(img_size, 256)),
-            A.RandomCrop(width=img_size, height=img_size),
+        aug = [
+            A.RandomCrop(img_size, img_size),
             A.HorizontalFlip(p=0.5),
-            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
-            A.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
-            ToTensorV2(),
-        ])
-    return A.Compose([
-        A.LongestMaxSize(max(img_size, 256)),
-        A.CenterCrop(img_size, img_size),
+            A.ShiftScaleRotate(shift_limit=0.05,
+                               scale_limit=0.05,
+                               rotate_limit=15, p=0.5),
+        ]
+    else:
+        aug = [A.CenterCrop(img_size, img_size)]
+
+    tail = [
         A.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
         ToTensorV2(),
-    ])
-
+    ]
+    return A.Compose(base + aug + tail)
 
 class EmbryoDataModule(pl.LightningDataModule):
     def __init__(self, root: str, img_size: int = 224, batch_size: int = 16, num_workers: int = 4):
@@ -149,23 +161,24 @@ class LitSlotCVIT(pl.LightningModule):
 
     def _shared_step(self, batch, stage: str):
         images, labels = batch
-        out = self.model(images, return_unsup_attn=True)
-        # expected: out = (logits, unsup_attn, *others)
-        logits, unsup_attn = out[0], out[1]
+        logits, unsup_attn, *_ = self.model(images) 
 
         ce_loss = self.criterion(logits, labels)
-        sparse_loss, div_loss, _ = _unsup_slot_losses(unsup_attn, self.hparams.lambda_sparse, self.hparams.lambda_div)
-        loss = ce_loss + sparse_loss + div_loss
+        sp_loss, div_loss, _ = _unsup_slot_losses(
+            unsup_attn, self.hparams.lambda_sparse, self.hparams.lambda_div
+        )
+        loss = ce_loss + sp_loss + div_loss
 
         preds = logits.argmax(dim=1)
         acc = self.train_acc(preds, labels) if stage == "train" else self.val_acc(preds, labels)
 
-        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{stage}_acc",  acc,  prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}_loss", loss, prog_bar=True)
+        self.log(f"{stage}_acc", acc, prog_bar=True)
+        self.log(f"{stage}_sp_loss", sp_loss, prog_bar=True)
+        self.log(f"{stage}_div_loss", div_loss, prog_bar=True)
+
         if stage == "train":
             self.log("loss_ce", ce_loss, prog_bar=False)
-            self.log("loss_sparse", sparse_loss)
-            self.log("loss_div", div_loss)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -173,12 +186,14 @@ class LitSlotCVIT(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         self._shared_step(batch, "val")
+    
+    def test_step(self, batch, batch_idx):
+        self._shared_step(batch, "test")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
         return [optimizer], [scheduler]
-
 
 # ────────────────────────────────────────────────────────────
 # 3. CLI
@@ -188,7 +203,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Embryo SlotCVIT unsupervised concept fine‑tune")
     p.add_argument("--root", type=str, default="./embryo", help="Dataset root path")
     p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--n_unsup", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -199,6 +214,10 @@ def parse_args():
     p.add_argument("--gpus", type=int, default=1)
     return p.parse_args()
 
+def debug_hook(module, inputs, outputs):
+    _, attn, *_ = outputs
+    print("★ unsup_attn shape:", attn.shape)
+    module._forward_hooks.clear()   # 첫 호출 후 훅 제거
 
 def main():
     args = parse_args()
@@ -206,13 +225,15 @@ def main():
     dm = EmbryoDataModule(root=args.root, img_size=args.img_size, batch_size=args.batch_size, num_workers=args.num_workers)
     model = LitSlotCVIT(lr=args.lr, weight_decay=args.weight_decay, lambda_sparse=args.lambda_sparse,
                         lambda_div=args.lambda_div, n_unsup=args.n_unsup)
-
+    
+    #model.model.register_forward_hook(debug_hook)
     trainer = pl.Trainer(max_epochs=args.epochs, devices=args.gpus, accelerator="gpu" if torch.cuda.is_available() else "cpu",
                          precision=16, log_every_n_steps=20,
-                         default_root_dir="./checkpoints")
+                         default_root_dir="./checkpoints",
+                         )
     trainer.fit(model, datamodule=dm)
     trainer.test(model, datamodule=dm)
 
-
 if __name__ == "__main__":
     main()
+    sys.exit()
