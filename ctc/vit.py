@@ -818,7 +818,7 @@ class ConceptCentricTransformerQSA(nn.Module):
 
         out = 0.0
         if self.n_unsup_concepts > 0:  # unsupervised stream
-            unsup_concepts, unsup_concepts_slot_attn = self.unsup_concept_slot_attention(x_cls)
+            unsup_concepts, unsup_concepts_slot_attn = self.unsup_concept_slot_attention(x_cls, None)
             unsup_concepts += self.unsup_concept_slot_pos.view(-1, self.n_unsup_concepts, self.embedding_dim)
             out_unsup, unsup_concept_attn = self.concept_tranformer(x_cls, unsup_concepts)
             unsup_concept_attn = unsup_concept_attn.mean(1)  # average over heads
