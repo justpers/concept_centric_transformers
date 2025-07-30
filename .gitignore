@@ -167,3 +167,6 @@ cython_debug/
 # log
 logs/
 embryo_slotcvit_sa/
+logs_old/
+embryo_slotcvit_sa_old/
+checkpoints/
