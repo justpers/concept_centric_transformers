@@ -13,30 +13,30 @@ import ctc
 import numpy as np
 
 
-def _unsup_slot_losses(attn,  # [B, C, N]
-                    λ_sparse: float,
-                    λ_div: float):
-    """
-    • sparsity  : 슬롯-별 엔트로피 ↓
-    • diversity : 슬롯 간 토큰 중복 ↓
-    반환: (loss_total, loss_sparse, loss_div)
-    """
-    if attn is None:
-        zero = torch.tensor(0., device='cuda' if torch.cuda.is_available() else 'cpu')
+def _unsup_slot_losses(attn, λ_sparse: float, λ_div: float):
+    if attn is None or (λ_sparse == 0 and λ_div == 0):
+        zero = torch.tensor(0., device=attn.device if attn is not None else 'cpu')
         return zero, zero, zero
 
-    C = attn.size(1)
-    p = attn.clamp_min(1e-8)            # 안전 log
-    entropy = -(p * p.log()).sum(-1).mean()          # [B,C] → 평균
-    sparsity = entropy / torch.log(torch.tensor(C, device=attn.device, dtype=p.dtype))       # 값이 작아야 좋음
+    if attn.size(1) == 1 and attn.size(2) > 1:
+        attn = attn.transpose(1, 2)
 
-    # 슬롯 간 유사도(=겹침) : off-diag dot-product
-    sim = torch.einsum('bcn,bdn->bcd', p, p)            # [B,C,C]
-    eye = torch.eye(C, device=sim.device)
-    diversity = (sim * (1 - eye)).mean()               # 작아야 좋음
+    # ---- ① FP32로 계산해 overflow 방지
+    p = attn.float().clamp_min(1e-8)          # [B,C,N]
+    C = p.size(1)
 
-    total = λ_sparse * sparsity + λ_div * diversity
-    return total, sparsity, diversity
+    # ---- ② 슬롯별 엔트로피 (0~1 로 정규화)
+    entropy = -(p * p.log()).sum(-1).mean()   # H ∈ [0, ln C]
+    sparsity = entropy / torch.log(torch.tensor(float(C), device=p.device))
+
+    # ---- ③ 슬롯 간 중복(dot-sim)
+    sim = torch.einsum('bcn,bdn->bcd', p, p)  # [B,C,C]
+    eye  = torch.eye(C, device=p.device)
+    diversity = (sim * (1 - eye)).mean()
+
+    loss = λ_sparse * sparsity + λ_div * diversity
+    # 계산 끝나면 다시 dtype 맞춰 줌
+    return loss.to(attn.dtype), sparsity.to(attn.dtype), diversity.to(attn.dtype)
 
 class CTCModel(pl.LightningModule):
     def __init__(
@@ -97,11 +97,13 @@ class CTCModel(pl.LightningModule):
         """
         outputs, unsup_concept_attn, concept_attn, spatial_concept_attn = self.model(x)
         logits = F.log_softmax(outputs, dim=-1)
+        print(unsup_concept_attn.shape)
 
         return logits, unsup_concept_attn, concept_attn, spatial_concept_attn
 
     def training_step(self, batch, batch_idx):
         (
+            total_loss,
             logits,
             preds,
             ce_loss,
@@ -109,19 +111,13 @@ class CTCModel(pl.LightningModule):
             expl_loss,
             l1_loss,
             sparse_loss, div_loss,   # 수정
+            unsup_loss,
             _, _, _
         ) = self.shared_step(batch, task=self.task, num_classes=self.num_classes)
-        loss  = ce_loss
-        if self.hparams.expl_lambda > 0:
-            loss = loss + self.hparams.expl_lambda * expl_loss
-        if self.hparams.attention_sparsity > 0:
-            loss = loss + self.hparams.attention_sparsity * l1_loss
-        if self.hparams.lambda_unsup_sparse > 0:
-            loss = loss + self.hparams.lambda_unsup_div * div_loss + self.hparams.lambda_unsup_sparse * sparse_loss
 
         self.log_dict(
             {
-                "train_loss": loss,
+                "train_loss": total_loss,
                 "train_ce_loss": ce_loss,
                 "train_acc": acc,
                 "train_expl_loss": expl_loss,
@@ -134,17 +130,19 @@ class CTCModel(pl.LightningModule):
             sync_dist=True
         )
 
-        return loss
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         (
+            total_loss,
             logits,
             preds,
             ce_loss,
             acc,
             expl_loss,
             l1_loss,
-            _, _, unsup_concept_attn,   # 수정
+            _, _, 
+            unsup_loss, unsup_concept_attn,   # 수정
             _, _
         ) = self.shared_step(batch, task=self.task, num_classes=self.num_classes)
         # if batch_idx == 0:
@@ -165,6 +163,7 @@ class CTCModel(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         (
+            total_loss,
             logits,
             preds,
             ce_loss,
@@ -173,6 +172,7 @@ class CTCModel(pl.LightningModule):
             l1_loss,
             sparse_loss,
             div_loss,
+            unsup_loss,
             _, _, _
         ) = self.shared_step(batch, task=self.task, num_classes=self.num_classes)
         self.log_dict(
@@ -181,7 +181,8 @@ class CTCModel(pl.LightningModule):
                 "test_acc": acc,
                 "test_expl_loss": expl_loss,
                 "test_l1_loss": l1_loss,
-
+                "unsup_div": div_loss,
+                "unsup_sparse": sparse_loss
             },
             sync_dist=True
         )
@@ -191,6 +192,7 @@ class CTCModel(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         x, expl, spatial_expl, y = batch
         (
+            total_loss,
             logits,
             preds,
             ce_loss,
@@ -198,6 +200,7 @@ class CTCModel(pl.LightningModule):
             expl_loss,
             l1_loss,
             _, _,
+            unsup_loss,
             unsup_concept_attn,
             concept_attn,
             spatial_concept_attn,
@@ -261,20 +264,8 @@ class CTCModel(pl.LightningModule):
             unsup_loss
         )
 
-        # ----------------------------- 7. logging
-        self.log_dict(
-            {
-                "loss": total_loss,
-                "ce": ce_loss,
-                "acc": acc,
-                "expl": expl_loss,
-                "l1": l1_loss,
-                "unsup_sparse": sparse_loss,
-                "unsup_div": div_loss,
-            },
-            prog_bar=True, on_step=False, on_epoch=True, sync_dist=True,
-        )
         return (
+            total_loss,
             logits,
             preds,
             ce_loss,
@@ -283,6 +274,7 @@ class CTCModel(pl.LightningModule):
             l1_loss,
             sparse_loss,
             div_loss,
+            unsup_loss,
             unsup_concept_attn,
             concept_attn,
             spatial_concept_attn,
