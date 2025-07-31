@@ -145,7 +145,7 @@ class LitSlotCVIT(pl.LightningModule):
             num_classes=2,
             n_unsup_concepts=n_unsup,
             n_concepts=0,
-            n_spatial_concepts=0,
+            n_spatial_concepts=4,
             num_heads=12,
             attention_dropout=0.1,
             projection_dropout=0.1,
@@ -212,12 +212,25 @@ def parse_args():
     p.add_argument("--lambda_div", type=float, default=1.0)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--gpus", type=int, default=1)
+    p.add_argument("--check_attn", action="store_true", help="CLS 어텐션 한 번만 찍고 종료")
     return p.parse_args()
 
-def debug_hook(module, inputs, outputs):
+def debug_hook(module, inputs, outputs):   # <─ 확인용 함수
     _, attn, *_ = outputs
     print("★ unsup_attn shape:", attn.shape)
-    module._forward_hooks.clear()   # 첫 호출 후 훅 제거
+    module._forward_hooks.clear()  
+
+def quick_check(model, dm):              # <─ 확인용 함수
+    args = parse_args()
+    dm.setup("val")
+    imgs, _ = next(iter(dm.val_dataloader()))
+    imgs = imgs.to(model.device)
+    model.eval()
+    with torch.no_grad():
+        _, attn, *_ = model.model(imgs[:1])   # (1, C, N) or (1, N, C)
+    if attn.size(1) != args.n_unsup:
+        attn = attn.transpose(1, 2)
+    print("★ attn distrib:", attn.squeeze().cpu().numpy())
 
 def main():
     args = parse_args()
@@ -227,6 +240,10 @@ def main():
                         lambda_div=args.lambda_div, n_unsup=args.n_unsup)
     
     #model.model.register_forward_hook(debug_hook)
+    if args.check_attn:
+        quick_check(model, dm)
+        return
+    
     trainer = pl.Trainer(max_epochs=args.epochs, devices=args.gpus, accelerator="gpu" if torch.cuda.is_available() else "cpu",
                          precision=16, log_every_n_steps=20,
                          default_root_dir="./checkpoints",
