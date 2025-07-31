@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 import torchmetrics
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-torch.set_float32_matmul_precision('medium')
+torch.set_float32_matmul_precision('high')
 
 # ────────────────────────────────────────────────────────────
 # 1. Dataset & DataModule
@@ -203,7 +203,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Embryo SlotCVIT unsupervised concept fine‑tune")
     p.add_argument("--root", type=str, default="./embryo", help="Dataset root path")
     p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--n_unsup", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
