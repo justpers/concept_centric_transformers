@@ -766,6 +766,7 @@ class ConceptCentricTransformerQSA(nn.Module):
         if n_unsup_concepts > 0:
             self.unsup_concept_slot_attention = ConceptQuerySlotAttention(num_iterations=num_iterations,
                                                                           slot_size=embedding_dim,
+                                                                          num_slots=n_unsup_concepts,   # 비지도 슬롯 개수 추가
                                                                           mlp_hidden_size=embedding_dim,
                                                                           )
             self.unsup_concept_slot_pos = nn.Parameter(torch.zeros(1, 1, n_unsup_concepts * embedding_dim),
@@ -820,7 +821,7 @@ class ConceptCentricTransformerQSA(nn.Module):
         if self.n_unsup_concepts > 0:  # unsupervised stream
             unsup_concepts, unsup_concepts_slot_attn = self.unsup_concept_slot_attention(x_cls, None)
             unsup_concepts += self.unsup_concept_slot_pos.view(-1, self.n_unsup_concepts, self.embedding_dim)
-            out_unsup, unsup_concept_attn = self.concept_tranformer(x_cls, unsup_concepts)
+            out_unsup, unsup_concept_attn = self.unsup_concept_tranformer(x_cls, unsup_concepts)
             unsup_concept_attn = unsup_concept_attn.mean(1)  # average over heads
             out = out + out_unsup.squeeze(1)  # squeeze token dimension
 
