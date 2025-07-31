@@ -803,6 +803,7 @@ class ConceptCentricTransformerQSA(nn.Module):
             nn.init.xavier_uniform_(self.spatial_concept_slots_init.weight)
             self.spatial_concept_slot_attention = ConceptQuerySlotAttention(num_iterations=num_iterations,
                                                                             slot_size=embedding_dim,
+                                                                            num_slots=n_spatial_concepts,
                                                                             mlp_hidden_size=embedding_dim)
             self.spatial_concept_slot_pos = nn.Parameter(torch.zeros(1, 1, n_spatial_concepts * embedding_dim),
                                                          requires_grad=True)
