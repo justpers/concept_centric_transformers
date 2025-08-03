@@ -4,8 +4,10 @@ import matplotlib.cm as cm
 from embryo_unsup import LitSlotCVIT, EmbryoDataModule
 
 # ───────────────────────────── 헬퍼 ──────────────────────────────
-def to_rgb(img_t):                      # (3,H,W) 0~1 → PIL
-    return Image.fromarray((img_t.permute(1,2,0).cpu().numpy()*255).astype("uint8"))
+def to_pil_gray(img_t):           # (1,H,W)  tensor, 값범위 -1~1
+    img = (img_t * 0.5 + 0.5).clamp(0, 1)      # → 0~1
+    arr = (img.squeeze(0).cpu().numpy() * 255).astype("uint8")
+    return Image.fromarray(arr, mode="L")
 
 def attn_to_mask(vec, n_slots, img_size=224, patch=16):
     """
@@ -85,7 +87,7 @@ def main(
 
         for rank, idx in enumerate(top_idx):
             img_t, _ = dm.test_ds[idx]                  # (3,H,W)
-            img_pil = to_rgb(img_t)                     # 0-1 tensor → PIL
+            img_pil = to_pil_gray(img_t)                     # 0-1 tensor → PIL
 
             mask_map = attn_to_mask(attn[idx], n_unsup, img_size)[s]  # (H,W)
             mask_bin = (mask_map > thres * mask_map.max()).float()
