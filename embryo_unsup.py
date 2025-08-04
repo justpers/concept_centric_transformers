@@ -1,3 +1,13 @@
+"""
+Embryo‐dataset fine‑tuning script (classification + *unsupervised* SlotCVIT QSA).
+
+* 개념 슬롯은 **비지도**로만 학습(n_unsup_concepts>0, n_concepts=n_spatial_concepts=0)
+* 분류 헤드는 성공/실패(2‑class) 지도 학습(CrossEntropy)
+* Loss = CE  +  λ_sparse·Sparsity  +  λ_div·Diversity ‑‑> _unsup_slot_losses 구현 참조
+
+Tested with torch 2.3 / pytorch‑lightning 1.9; modify paths & hyper‑params as needed.
+"""
+
 from __future__ import annotations
 import argparse, os, glob
 from typing import List, Tuple
@@ -12,8 +22,6 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 import torchmetrics
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.models.vision_transformer import PatchEmbed
-import cv2
 torch.set_float32_matmul_precision('high')
 
 # ────────────────────────────────────────────────────────────
@@ -52,7 +60,6 @@ def default_transforms(img_size: int = 224, is_train: bool = True):
             border_mode=0,
             value=0,                       # <─ 추가
         ),
-        A.Lambda(image=lambda x: cv2.cvtColor(x, cv2.COLOR_RGB2GRAY)[..., None])
     ]
     if is_train:
         aug = [
@@ -66,7 +73,7 @@ def default_transforms(img_size: int = 224, is_train: bool = True):
         aug = [A.CenterCrop(img_size, img_size)]
 
     tail = [
-        A.Normalize(mean=(0.5,), std=(0.5,)),
+        A.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
         ToTensorV2(),
     ]
     return A.Compose(base + aug + tail)
@@ -147,15 +154,6 @@ class LitSlotCVIT(pl.LightningModule):
         self.criterion = nn.CrossEntropyLoss()
         self.train_acc = torchmetrics.Accuracy(task="multiclass", num_classes=2)
         self.val_acc   = torchmetrics.Accuracy(task="multiclass", num_classes=2)
-        vit = self.model.feature_extractor
-        old_pe: PatchEmbed = vit.patch_embed
-        new_pe = PatchEmbed(img_size=224, patch_size=16, in_chans=1, embed_dim=old_pe.proj.out_channels)
-        with torch.no_grad():
-            new_pe.proj.weight.copy_(old_pe.proj.weight.mean(1, keepdim=True))
-            new_pe.proj.bias.copy_(old_pe.proj.bias)
-        vit.patch_embed = new_pe
-        print("✅ PatchEmbed 교체 완료 (in_chans = 1)")
-
 
     # ‑‑‑ Lightning hooks ‑‑‑
     def forward(self, x):
@@ -203,7 +201,7 @@ class LitSlotCVIT(pl.LightningModule):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Embryo SlotCVIT unsupervised concept fine‑tune")
-    p.add_argument("--root", type=str, default="./embryo", help="Dataset root path")
+    p.add_argument("--root", type=str, default="./transfer", help="Dataset root path")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--img_size", type=int, default=224)
