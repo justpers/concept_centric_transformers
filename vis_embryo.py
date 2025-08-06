@@ -4,9 +4,12 @@ import matplotlib.cm as cm
 from embryo_unsup import LitSlotCVIT, EmbryoDataModule
 
 # ───────────────────────────── 헬퍼 ──────────────────────────────
-def to_rgb(img_t):                      # (3,H,W) 0~1 → PIL
-    return Image.fromarray((img_t.permute(1,2,0).cpu().numpy()*255).astype("uint8"))
-
+def to_rgb(img_t, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)):
+    # 역정규화 → 0~1
+    for t, m, s in zip(img_t, mean, std):
+        t.mul_(s).add_(m)
+    img = img_t.clamp(0,1).permute(1,2,0).cpu().numpy()
+    return Image.fromarray((img*255).astype("uint8"), mode="RGB")
 def attn_to_mask(vec, n_slots, img_size=224, patch=16):
     """
     vec : (C,N) or (N,C) 1-이미지 어텐션
