@@ -1,8 +1,9 @@
 import albumentations as A
 import pytorch_lightning as pl
+from albumentations import HorizontalFlip, Normalize
 from albumentations.augmentations.geometric.resize import Resize
 from albumentations.augmentations.geometric.rotate import Rotate
-from albumentations.augmentations.transforms import HorizontalFlip, Normalize
+#from albumentations.augmentations.transforms import HorizontalFlip, Normalize
 from albumentations.pytorch.transforms import ToTensorV2
 from torch.utils.data import DataLoader, random_split
 from .cub2011parts import CUB2011Parts_dataset

@@ -475,6 +475,7 @@ class ConceptQuerySlotAttention(nn.Module):
             self,
             num_iterations,
             slot_size,
+            num_slots: int,
             mlp_hidden_size,
             truncate='bi-level',
             epsilon=1e-8,
@@ -496,15 +497,21 @@ class ConceptQuerySlotAttention(nn.Module):
         self.gru = gru_cell(slot_size, slot_size)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.initial_slots = nn.Parameter(
+            torch.randn(1, num_slots, slot_size)
+        )
 
-    def forward(self, features, slots_init):
+    def forward(self, features, slots_init=None):
         # `feature` has shape [batch_size, num_feature, inputs_size].
         features = self.norm_feature(features)
         k = self.project_k(features)  # Shape: [B, num_features, slot_size]
         v = self.project_v(features)  # Shape: [B, num_features, slot_size]
 
         B, N, D = v.shape
-        slots = slots_init
+        # slots_init이 없으면 learnable 초기 슬롯을 배치 차원으로 복제
+        if slots_init is None:
+            slots_init = self.initial_slots.expand(B, -1, -1)
+        slots = slots_init.clone()
         # Multiple rounds of attention.
         for i in range(self.num_iterations):
             if i == self.num_iterations - 1:
