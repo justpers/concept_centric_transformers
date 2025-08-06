@@ -7,9 +7,12 @@ warnings.filterwarnings("ignore")
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True, warn_only=True)
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
+pl.seed_everything(42, workers=True)
 from ctc.swin import SlotCSwinQSA, SlotCSwinISA, SlotCSwinSA
 from ctc.vit  import SlotCVITQSA, SlotCVITISA, SlotCVITSA
 import torchmetrics
@@ -272,6 +275,7 @@ def main():
     trainer = pl.Trainer(max_epochs=args.epochs, devices=args.gpus, accelerator="gpu" if torch.cuda.is_available() else "cpu",
                          precision=16, log_every_n_steps=20,
                          default_root_dir="./checkpoints",
+                         deterministic=True
                          )
     trainer.fit(model, datamodule=dm)
     trainer.test(model, datamodule=dm)
