@@ -1,10 +1,11 @@
 import os, torch
 from PIL import Image
 import matplotlib.cm as cm
-from embryo_unsup import LitSlotCVIT, EmbryoDataModule
+from embryo_unsup import LitCCT, EmbryoDataModule, CCTCfg
+from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 # ───────────────────────────── 헬퍼 ──────────────────────────────
-def to_rgb(img_t, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)):
+def to_rgb(img_t, mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD):
     # 역정규화 → 0~1
     for t, m, s in zip(img_t, mean, std):
         t.mul_(s).add_(m)
@@ -36,7 +37,7 @@ def overlay(img_pil, mask, cmap='jet', alpha=0.4):
 
 # ───────────────────────────── main ──────────────────────────────
 def main(
-    ckpt_path="checkpoints/lightning_logs/version_2/checkpoints/epoch=39-step=1440.ckpt",
+    ckpt_path="checkpoints/lightning_logs/version_1/checkpoints/epoch=39-step=1440.ckpt",
     out_dir="vis_slots",
     n_unsup=4,
     img_size=224,
@@ -46,26 +47,30 @@ def main(
     os.makedirs(out_dir, exist_ok=True)
 
     # 1) datamodule
-    dm = EmbryoDataModule(root="./transfer", img_size=img_size,
+    dm = EmbryoDataModule(root="./embryo", img_size=img_size,
                           batch_size=16, num_workers=4)
     dm.setup("test")
 
     # 2) 모델 복원 (학습 때 사용한 하이퍼파라미터 그대로)
     print("🔹 checkpoint 로드 중 …")
-    model = LitSlotCVIT.load_from_checkpoint(
+    cfg = CCTCfg(backbone="swin_tiny", slot_type="qsa", n_unsup=n_unsup)
+    model = LitCCT.load_from_checkpoint(
         ckpt_path,
+        cfg=cfg,
         lr=1e-4, weight_decay=0.05,
         lambda_sparse=1.0, lambda_div=1.0,
-        n_unsup=n_unsup
     )
-    model.eval();  model.freeze()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device).eval()
+    model.freeze()
+    #model.eval();  model.freeze()
 
     # 3) test forward → spatial_attn 수집
     print("🔹 test set forward (예측) …")
     spat_list = []
     for imgs, _ in dm.test_dataloader():
         with torch.no_grad():
-            imgs = imgs.to(model.device)
+            imgs = imgs.to(device)
             *_, spatial_attn = model.model(imgs)        # (B,N,C)  or (B,C,N)
         spat_list.append(spatial_attn.cpu())
     attn = torch.cat(spat_list)                         # (B,*,*)
