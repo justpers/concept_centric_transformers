@@ -564,3 +564,10 @@ def gru_cell(input_size, hidden_size, bias=True):
         nn.init.zeros_(m.bias_hh)
 
     return m
+
+MODEL_REGISTRY = {}
+def register(name):
+    def _decor(fn):
+        MODEL_REGISTRY[name] = fn
+        return fn
+    return _decor
