@@ -140,20 +140,24 @@ def _unsup_slot_losses(attn: torch.Tensor, lambda_sparse: float, lambda_div: flo
         zero = torch.tensor(0., device=attn.device if attn is not None else "cpu")
         return zero, zero, zero
 
-    # attn: [B, C, N] (C = n_unsup_concepts)
+    # attn: [B, C, N] 
+    # (A) 토큰 축(N) 정규화
     if attn.size(1) == 1 and attn.size(2) > 1:  # safety transpose
         attn = attn.transpose(1, 2)
 
     p = attn.float().clamp_min(1e-8)  # [B,C,N]
-    C = p.size(1)
+    p = p / (p.sum(dim=-1, keepdim=True) + 1e-8)
 
-    # (1) sparsity: 평균 슬롯 엔트로피 정규화
-    entropy = -(p * p.log()).sum(-1).mean()          # H ∈ [0, ln C]
-    sparsity = entropy / torch.log(torch.tensor(float(C), device=p.device))
+    B, C, N = p.shape
 
-    # (2) diversity: 슬롯 간 dot‑sim 평균
-    avg_sim = torch.einsum("bcn,bcm->bnm", p, p).mean()  # rough similarity measure
-    diversity = avg_sim / C
+    # # (B) sparsity = 정규화된 엔트로피 / ln(N)  → [0,1]
+    entropy = -(p * p.log()).sum(-1).mean()         
+    sparsity = entropy / torch.log(torch.tensor(float(N), device=p.device))
+
+    # (C) diversity = 슬롯간 유사도(토큰 분포 dot) 평균
+    sim = torch.einsum('bcn,bdn->bcd', p, p)
+    offdiag = sim - torch.diag_embed(sim.diagonal(dim1=1, dim2=2))
+    diversity = offdiag.sum() / (B * C * (C - 1) + 1e-8)
 
     loss_sparse = lambda_sparse * sparsity
     loss_div    = lambda_div * diversity
