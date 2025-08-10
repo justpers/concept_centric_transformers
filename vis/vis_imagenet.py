@@ -2,7 +2,7 @@ from torchvision import datasets, transforms
 from pytorch_lightning import Trainer
 from ctc.ctc_model import load_exp
 from torch.utils.data.dataloader import DataLoader
-from vis.viz_utils import batch_predict_results
+from viz_utils import batch_predict_results
 import torch
 import os
 from PIL import Image

@@ -1,6 +1,6 @@
 from pytorch_lightning import Trainer
 from ctc import load_exp
-from viz_utils import batch_predict_results
+from vis.viz_utils import batch_predict_results
 import os
 import numpy as np
 import pandas as pd

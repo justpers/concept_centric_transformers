@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from torchvision import transforms
 
 from ctc import load_exp
-from viz_utils import batch_predict_results, remove_spines
+from vis.viz_utils import batch_predict_results, remove_spines
 import numpy as np
 from torchvision.datasets import CIFAR100
 import os
