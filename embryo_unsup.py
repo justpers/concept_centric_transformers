@@ -340,7 +340,7 @@ def main():
         return
     
     ckpt = ModelCheckpoint(monitor="val_acc", mode="max", save_last=True, save_top_k=1)
-    es = EarlyStopping(monitor="val_loss", mode="min", patience=8)
+    es = EarlyStopping(monitor="val_acc", mode="max", patience=8)
     
     trainer = pl.Trainer(max_epochs=args.epochs, devices=args.gpus, accelerator="gpu" if torch.cuda.is_available() else "cpu",
                          precision=16, log_every_n_steps=20,
