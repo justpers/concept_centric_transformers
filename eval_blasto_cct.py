@@ -143,13 +143,12 @@ def load_cct_model(args, device):
 # 4) CCT → 확률 출력 래퍼 (metrics 가 기대하는 인터페이스)
 # ============================================================
 class CCTModelWrapper(torch.nn.Module):
-    """metrics.* 코드가 model(x)->(B,C) 확률을 기대한다고 가정하여 래핑."""
     def __init__(self, cct_model: torch.nn.Module):
         super().__init__()
         self.cct = cct_model
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, softmax: bool = False, **kwargs) -> torch.Tensor:
         out = self.cct(x)
         # CCT forward 가 (logits, unsup, concept, spatial_concept) 형태라고 가정
         if isinstance(out, (tuple, list)) and len(out) >= 1:
@@ -159,42 +158,104 @@ class CCTModelWrapper(torch.nn.Module):
         probs = F.softmax(logits, dim=1)
         return probs
 
-
 # ============================================================
-# 5) CCT 설명맵 (Grad-CAM식, 클래스-특이)
+# 5) CCT 설명맵 (Grad-CAM: Swin feature_extractor.norm 대상)
 # ============================================================
 class CCTExplainer:
-    def __init__(self, cct_model: torch.nn.Module, input_size=(224,224)):
+    def __init__(self, cct_model: torch.nn.Module, input_size=(224, 224)):
+        """
+        LitCCT(model=...) 또는 내부 모델을 모두 지원.
+        target_layer는 Swin의 마지막 정규화 레이어(feature_extractor.norm)를 기본 타깃으로 삼음.
+        """
         self.model = cct_model
         self.input_size = input_size
 
+        # LitCCT 안에 실제 모델이 있는 경우를 처리
+        core = getattr(self.model, "model", self.model)
+        fx = getattr(core, "feature_extractor", None)
+        if fx is None:
+            raise RuntimeError("CCTExplainer: feature_extractor를 찾지 못했습니다. 백본 경로를 확인하세요.")
+
+        # Grad-CAM 타깃 레이어 선택 (Swin: 마지막 norm)
+        self.target_layer = getattr(fx, "norm", None)
+        if self.target_layer is None:
+            # 혹시 구조가 조금 다르면 layers의 마지막 블록을 타깃으로
+            layers = getattr(fx, "layers", None)
+            if layers is None or len(layers) == 0:
+                raise RuntimeError("CCTExplainer: Grad-CAM 대상 레이어를 찾지 못했습니다.")
+            self.target_layer = layers[-1]
+
+        self._features = None
+        self._grads = None
+
+    def _fwd_hook(self, module, inp, out):
+        # Swin은 [B, H, W, C]가 나옵니다 (channels_last)
+        self._features = out
+
+    def _bwd_hook(self, module, grad_in, grad_out):
+        # grad_out[0]이 forward 출력에 대한 gradient
+        self._grads = grad_out[0]
+
     def saliency(self, x: torch.Tensor, target_idx: int) -> torch.Tensor:
+        """
+        Grad-CAM on feature_extractor.norm.
+        반환: [1,1,H,W] (0~1 정규화, 입력 크기로 업샘플)
+        """
         self.model.eval()
-        x = x.requires_grad_(True)
+        self._features, self._grads = None, None
 
-        logits, *rest = self.model(x)   # (B,C), ...
-        spatial = rest[-1]              # [B, K, Hs, Ws] 가정
+        # hooks 등록
+        h1 = self.target_layer.register_forward_hook(self._fwd_hook)
+        h2 = self.target_layer.register_full_backward_hook(self._bwd_hook)
 
-        # ★ 비-리프 텐서의 grad를 저장하도록 보장
-        spatial = spatial.requires_grad_(True)
-        spatial.retain_grad()
-
+        # forward
+        out = self.model(x)                          # (logits, ...)
+        logits = out[0] if isinstance(out, (tuple, list)) else out
         score = logits[:, target_idx].sum()
+
+        # backward
         self.model.zero_grad(set_to_none=True)
         score.backward(retain_graph=True)
 
-        grads = spatial.grad            # ← 이제 None 아님
-        weights = grads.mean(dim=(2,3), keepdim=True)
-        cam = (weights * spatial).sum(dim=1, keepdim=True)
+        # hooks 해제
+        h1.remove(); h2.remove()
+
+        feats = self._features
+        grads = self._grads
+        if feats is None or grads is None:
+            # 마지막 방어: Grad-CAM 못 얻으면 균일맵 반환(지표 계산은 가능)
+            H, W = self.input_size
+            return torch.ones(1, 1, H, W, device=x.device)
+
+        # Swin norm 출력은 [B, H, W, C*8] (channels_last) 형태
+        if feats.ndim == 4 and feats.shape[-1] >= feats.shape[1]:
+            # channels_last -> NCHW
+            feats = feats.permute(0, 3, 1, 2).contiguous()
+            grads = grads.permute(0, 3, 1, 2).contiguous()
+        elif feats.ndim == 3:
+            # [B, N, C]이면 정사각형으로 복원 시도 (예: 14x14 토큰)
+            B, N, C = feats.shape
+            side = int(round(N ** 0.5))
+            if side * side == N:
+                feats = feats.view(B, side, side, C).permute(0, 3, 1, 2).contiguous()
+                grads = grads.view(B, side, side, C).permute(0, 3, 1, 2).contiguous()
+            else:
+                # 토큰이 정사각형이 아니면 균일맵 반환
+                H, W = self.input_size
+                return torch.ones(1, 1, H, W, device=x.device)
+
+        # Grad-CAM: 채널 가중치 = 평균 gradient
+        weights = grads.mean(dim=(2, 3), keepdim=True)           # [B,C,1,1]
+        cam = (weights * feats).sum(dim=1, keepdim=True)         # [B,1,h,w]
         cam = F.relu(cam)
 
+        # 업샘플 & [0,1] 정규화
         cam = F.interpolate(cam, size=self.input_size, mode="bilinear", align_corners=False)
-        cam_min = cam.amin(dim=(2,3), keepdim=True)
-        cam_max = cam.amax(dim=(2,3), keepdim=True)
+        cam_min = cam.amin(dim=(2, 3), keepdim=True)
+        cam_max = cam.amax(dim=(2, 3), keepdim=True)
         cam = (cam - cam_min) / (cam_max - cam_min + 1e-6)
 
-        x.requires_grad_(False)
-        return cam.detach()
+        return cam.detach()  # [B,1,H,W]
 
 # ============================================================
 # 6) 설명맵 PNG 저장 (SCOUTER와 동일 폴더 규약)
