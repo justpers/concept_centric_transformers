@@ -17,6 +17,7 @@ from ctc.swin import SlotCSwinQSA, SlotCSwinISA, SlotCSwinSA
 from ctc.vit  import SlotCVITQSA, SlotCVITISA, SlotCVITSA
 import torchmetrics
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+import math
 
 # 1. Dataset & DataModule
 class EmbryoDataset(Dataset):
@@ -134,34 +135,29 @@ def build_cct(cfg: CCTCfg) -> nn.Module:
         projection_dropout=cfg.proj_drop,
     )
 
-def _unsup_slot_losses(attn: torch.Tensor, lambda_sparse: float, lambda_div: float):
+def _unsup_slot_losses(attn, lambda_sparse, lambda_div):
     if attn is None or (lambda_sparse == 0 and lambda_div == 0):
-        zero = torch.tensor(0., device=attn.device if attn is not None else "cpu")
-        return zero, zero, zero
+        z = attn.new_tensor(0.) if attn is not None else torch.tensor(0.)
+        return z, z, z
 
-    # attn: [B,C,N] 또는 [B,N,C] -> [B,C,N]
-    if attn.dim() == 2:  # safety
-        attn = attn.unsqueeze(1)
-    if attn.size(1) != attn.size(-1) and attn.size(1) not in (1, 2, 3, 4, 8, 16, 32):  # 대략적인 체크
-        attn = attn.transpose(1, 2)
+    # attn -> [B,C,N], 토큰축 정규화
+    if attn.size(1) not in (2,3,4,6,8,12,16):  # 대략 체크
+        attn = attn.transpose(1,2)
     B, C, N = attn.shape
-
     eps = 1e-12
-    # 토큰 방향 확률화: 각 슬롯 맵이 토큰 축으로 합=1 되도록
     p = attn.float().clamp_min(eps)
-    p = p / (p.sum(dim=-1, keepdim=True) + eps)                # [B,C,N]
+    p = p / (p.sum(-1, keepdim=True) + eps)            # [B,C,N]
 
-    # (1) Sparsity: 슬롯별 토큰 분포 엔트로피 (0=스파스, 1=균일)
-    entropy = -(p * (p + eps).log()).sum(dim=-1)               # [B,C]
-    entropy_norm = entropy / torch.log(torch.tensor(float(N), device=p.device))
-    sparsity = entropy_norm.mean()                              # scalar ∈ [0,1]
+    # Sparsity: 엔트로피(0=스파스, 1=균일)
+    entropy = -(p * (p + eps).log()).sum(-1)           # [B,C]
+    sparsity = (entropy / math.log(N)).mean()          # scalar ∈[0,1]
 
-    # (2) Diversity: 슬롯 간 직교 유도 (토큰 차원 Gram, 단위행렬과 차이)
-    G = torch.matmul(p, p.transpose(1, 2)) / float(N)          # [B,C,C]
-    I = torch.eye(C, device=p.device).unsqueeze(0)              # [1,C,C]
-    diversity = ((G - I) ** 2).mean()                           # off-diagonal도 포함
+    # Diversity: off-diag만 평균 제곱
+    G = (p @ p.transpose(1,2)) / float(N)              # [B,C,C]
+    off = G - torch.diag_embed(G.diagonal(dim1=1, dim2=2))
+    diversity = (off**2).sum(dim=(1,2)) / (C*(C-1))    # scalar
 
-    return lambda_sparse * sparsity, lambda_div * diversity, entropy_norm.mean()
+    return lambda_sparse*sparsity, lambda_div*diversity, sparsity
 
 class LitCCT(pl.LightningModule):
     def __init__(self, cfg: CCTCfg, freeze_stages=0, warmup_epochs=3, lr: float = 1e-4, weight_decay: float = 0.05,
@@ -170,6 +166,7 @@ class LitCCT(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["cfg"])
         self.model = build_cct(cfg)
+        self.criterion = nn.CrossEntropyLoss(reduction="mean")
 
         if freeze_stages:
             self._freeze_encoder(freeze_stages)
@@ -178,39 +175,70 @@ class LitCCT(pl.LightningModule):
         self.train_acc = torchmetrics.Accuracy(task="multiclass", num_classes=2)
         self.val_acc   = torchmetrics.Accuracy(task="multiclass", num_classes=2)
 
+    def _slot_weight(self) -> float:
+        # warmup_epochs 만큼 선형 램프업, 이후 코사인 감쇠로 min_w까지
+        T1 = int(getattr(self.hparams, "warmup_epochs", 0) or 0)
+        min_w = float(getattr(self.hparams, "slot_min_weight", 0.3))  # 필요시 CLI 인자로 노출
+        T = int(self.trainer.max_epochs) if self.trainer is not None else (T1 + 1)
+
+        if T1 <= 0:
+            return 1.0
+
+        # 1) 램프업: (1/T1, 2/T1, ..., 1.0)
+        if self.current_epoch < T1:
+            return float(self.current_epoch + 1) / float(T1)
+
+        # 2) 코사인 감쇠: 1.0 → min_w
+        remain = max(1, T - T1)
+        t = min(self.current_epoch - T1, remain - 1)
+        denom = (remain - 1) if remain > 1 else 1
+        cos = 0.5 * (1.0 + math.cos(math.pi * t / denom))
+        return min_w + (1.0 - min_w) * cos
+
     def forward(self, x):
         return self.model(x)
 
     def _shared_step(self, batch, stage: str):
         images, labels = batch
-        logits, unsup_attn, *_ = self.model(images) 
+        logits, unsup_attn, *_ = self.model(images)
 
+        # 1) CE 손실을 확실히 스칼라로
         ce_loss = self.criterion(logits, labels)
+        if isinstance(ce_loss, torch.Tensor) and ce_loss.ndim > 0:
+            ce_loss = ce_loss.mean()
+
+        # 2) 슬롯 손실 (이미 스칼라일 확률이 높지만 안전장치)
         sp_loss, div_loss, _ = _unsup_slot_losses(
             unsup_attn, self.hparams.lambda_sparse, self.hparams.lambda_div
         )
+        if isinstance(sp_loss, torch.Tensor) and sp_loss.ndim > 0:
+            sp_loss = sp_loss.mean()
+        if isinstance(div_loss, torch.Tensor) and div_loss.ndim > 0:
+            div_loss = div_loss.mean()
 
-        scale = 1.0
-        if stage == "train":
-            wup = getattr(self.hparams, "warmup_epochs", 0)
-            if wup and wup > 0:
-                scale = min(1.0, (self.current_epoch + 1) / float(wup))
-
+        # 3) 웜업/감쇠 스케일(이미 넣어두신 로직/함수 사용)
+        scale = self._slot_weight() if stage == "train" else 1.0
         loss = ce_loss + scale * (sp_loss + div_loss)
+
+        # 최종 loss도 스칼라 보장
+        if isinstance(loss, torch.Tensor) and loss.ndim > 0:
+            loss = loss.mean()
 
         preds = logits.argmax(dim=1)
         acc = self.train_acc(preds, labels) if stage == "train" else self.val_acc(preds, labels)
 
-        self.log(f"{stage}_loss", loss, prog_bar=True)
-        self.log(f"{stage}_acc", acc, prog_bar=True)
-        self.log(f"{stage}_sp_loss", sp_loss, prog_bar=True)
-        self.log(f"{stage}_div_loss", div_loss, prog_bar=True)
+        bs = images.size(0)  # 배치 크기 로그 집계에 명시
+        self.log(f"{stage}_loss", loss, prog_bar=True, batch_size=bs)
+        self.log(f"{stage}_acc",  acc,  prog_bar=True, batch_size=bs)
+        self.log(f"{stage}_sp_loss",  sp_loss, prog_bar=True, batch_size=bs)
+        self.log(f"{stage}_div_loss", div_loss, prog_bar=True, batch_size=bs)
 
         if stage == "train":
-            self.log("lambda_scale", scale, prog_bar=True)                 # 램프 스케일 확인용
-            self.log("train_sp_loss_scaled", sp_loss * scale, prog_bar=False)
-            self.log("train_div_loss_scaled", div_loss * scale, prog_bar=False)
-            self.log("loss_ce", ce_loss, prog_bar=False)
+            self.log("lambda_scale", scale, prog_bar=True, batch_size=bs)
+            self.log("train_sp_loss_scaled", sp_loss * scale, prog_bar=False, batch_size=bs)
+            self.log("train_div_loss_scaled", div_loss * scale, prog_bar=False, batch_size=bs)
+            self.log("loss_ce", ce_loss, prog_bar=False, batch_size=bs)
+
         return loss
 
     def training_step(self, batch, batch_idx):
