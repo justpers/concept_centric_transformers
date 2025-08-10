@@ -12,19 +12,21 @@ from metrics.IAUC_DAUC import calc_iauc_and_dauc_batch
 from metrics.saliency_evaluation.eval_infid_sen import calc_infid_and_sens
 from metrics.area_size import calc_area_size
 
+from ctc.cct_builder import build_model
+
 # ============================================================
 # 1) 파서
 # ============================================================
 def build_parser():
     p = argparse.ArgumentParser("CCT on Blastocyst — IAUC/DAUC & Infid/Sens")
 
-    # --- 핵심 경로/모델 ---
+    # --- 체크포인트/모델 진입점 ---
     p.add_argument("--checkpoint", required=True, type=str, help=".ckpt 경로")
     p.add_argument("--model_entry", type=str, default=None,
-                   help="모델 빌더 진입점 'pkg.mod:func' (예: models.cct_builder:build_model). "
-                        "미지정 시 체크포인트에 저장된 모델 객체를 사용 시도")
+                   help="모델 빌더 'pkg.mod:func' (예: ctc.cct_builder:build_model)")
 
-    # --- 데이터셋/전처리 ---
+    # --- 데이터/전처리 ---
+    p.add_argument("--dataset_root", type=str, required=True, help="dataset 루트 (train/val 하위 포함)")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--device", type=str, default="cuda")
@@ -35,11 +37,27 @@ def build_parser():
     p.add_argument("--saliency", action="store_true", help="Infidelity/Sensitivity 계산")
     p.add_argument("--area_prec", action="store_true", help="area-size 평균")
     p.add_argument("--loss_status", type=int, default=1,
-                   help=">0 이면 positive, <0 이면 negative(L.S.C 타겟). 기본=1")
+                   help=">0: positive, <0: negative(LSC)")
 
-    # --- 데이터 로더 옵션(Blastocyst) ---
-    p.add_argument("--dataset_root", type=str, default=None,
-                   help="(선택) 데이터 루트. ConText/MakeListImage가 내부 경로를 알고 있으면 생략 가능")
+    # --- CCT 빌더용 하이퍼파라미터(훈련과 동일하게 맞추기) ---
+    p.add_argument("--backbone", choices=["swin_tiny","swin_large","vit_tiny","vit_base"], default="swin_tiny")
+    p.add_argument("--slot_type", choices=["qsa","isa","sa"], default="qsa")
+    p.add_argument("--model_name", type=str, default=None)
+
+    p.add_argument("--num_classes", type=int, default=2)
+    p.add_argument("--n_unsup", type=int, default=4)
+    p.add_argument("--n_concepts", type=int, default=0)
+    p.add_argument("--n_spatial", type=int, default=4)
+
+    p.add_argument("--attn_drop", type=float, default=0.1)
+    p.add_argument("--proj_drop", type=float, default=0.1)
+
+    p.add_argument("--freeze_stages", type=int, default=1)
+    p.add_argument("--warmup_epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=0.05)
+    p.add_argument("--lambda_sparse", type=float, default=1.0)
+    p.add_argument("--lambda_div", type=float, default=1.0)
 
     return p
 
@@ -81,37 +99,41 @@ def _dynamic_import(entry: str):
     return fn
 
 def load_cct_model(args, device):
+    import sys
     ckpt = torch.load(args.checkpoint, map_location=device)
 
-    # A) 체크포인트가 '그 자체가 모델 객체'인 경우
-    if isinstance(ckpt, torch.nn.Module):
-        model = ckpt.to(device).eval()
-        return model
-
-    # B) state_dict 형태 (ckpt['model'] 또는 ckpt 자체가 dict)
-    #    -> model_entry로 빌더를 불러 모델 생성 후 로드
+    # 1) 빌더 함수 로드
     if args.model_entry is None:
         raise ValueError(
             "checkpoint가 state_dict 형태로 보입니다. "
             "--model_entry '패키지.모듈:함수' 를 지정해 모델 인스턴스를 만들어 주세요."
         )
-
     build_fn = _dynamic_import(args.model_entry)
-    # build_fn은 사용자 레포의 빌더 규약에 맞춰야 합니다.
-    # 필요 시 args를 확장하세요.
-    model = build_fn(args)
-    model = model.to(device)
+    model = build_fn(args).to(device)
 
-    state_dict = ckpt.get("model", None)
+    # 2) state_dict 추출 (Lightning .ckpt / 커스텀 .pth 모두 대응)
+    state_dict = None
+    if isinstance(ckpt, dict):
+        if "state_dict" in ckpt:                      # ★ Lightning 체크포인트
+            sd = ckpt["state_dict"]
+            # 보통 LitCCT 안에 self.model이 있으므로 'model.' 접두어가 그대로 있어도 로드됩니다.
+            # 그래도 혹시 다른 접두어가 섞였을 때를 대비해 텐서만 필터링
+            state_dict = {k: v for k, v in sd.items() if torch.is_tensor(v)}
+        elif "model" in ckpt and isinstance(ckpt["model"], dict):
+            state_dict = ckpt["model"]                 # 커스텀 저장 형식
+        else:
+            # ckpt 자체가 state_dict일 수도 있음 (키-값이 텐서여야 함)
+            if all(torch.is_tensor(v) for v in ckpt.values()):
+                state_dict = ckpt
+
     if state_dict is None:
-        # ckpt가 곧 state_dict인 경우
-        state_dict = ckpt
+        raise RuntimeError("체크포인트에서 state_dict를 찾지 못했습니다. (.ckpt면 'state_dict' 키가 있어야 합니다)")
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
         print("⚠️ load_state_dict 경고:")
-        if missing:   print("  누락된 키:", missing)
-        if unexpected:print("  예상 밖 키:", unexpected)
+        if missing:   print("  누락 키:", missing)
+        if unexpected:print("  예기치 않은 키:", unexpected)
 
     model.eval()
     return model
@@ -147,41 +169,32 @@ class CCTExplainer:
         self.input_size = input_size
 
     def saliency(self, x: torch.Tensor, target_idx: int) -> torch.Tensor:
-        """
-        Grad-CAM 스타일로 spatial_concept_attn에 대한 클래스-특이 saliency 생성.
-        반환: [1, 1, H, W] 에서 [0,1] 정규화된 텐서 (입력 해상도)
-        """
         self.model.eval()
         x = x.requires_grad_(True)
 
-        # forward
-        logits, *rest = self.model(x)  # (B,C), ...
-        spatial = rest[-1]             # spatial_concept_attn [B, K, Hs, Ws] 라고 가정
-        if not spatial.requires_grad:
-            spatial = spatial.requires_grad_(True)
+        logits, *rest = self.model(x)   # (B,C), ...
+        spatial = rest[-1]              # [B, K, Hs, Ws] 가정
 
-        # 스칼라 점수: 타겟 클래스 로짓 합
+        # ★ 비-리프 텐서의 grad를 저장하도록 보장
+        spatial = spatial.requires_grad_(True)
+        spatial.retain_grad()
+
         score = logits[:, target_idx].sum()
         self.model.zero_grad(set_to_none=True)
         score.backward(retain_graph=True)
 
-        grads = spatial.grad           # [B,K,Hs,Ws]
-        # 채널 중요도: GAP over H,W
-        weights = grads.mean(dim=(2,3), keepdim=True)   # [B,K,1,1]
-        cam = (weights * spatial).sum(dim=1, keepdim=True)  # [B,1,Hs,Ws]
+        grads = spatial.grad            # ← 이제 None 아님
+        weights = grads.mean(dim=(2,3), keepdim=True)
+        cam = (weights * spatial).sum(dim=1, keepdim=True)
         cam = F.relu(cam)
 
-        # 업샘플 & [0,1] 정규화
         cam = F.interpolate(cam, size=self.input_size, mode="bilinear", align_corners=False)
         cam_min = cam.amin(dim=(2,3), keepdim=True)
         cam_max = cam.amax(dim=(2,3), keepdim=True)
         cam = (cam - cam_min) / (cam_max - cam_min + 1e-6)
 
-        # 그래디언트 덮어쓰기 방지
         x.requires_grad_(False)
-        spatial.requires_grad_(False)
-        return cam.detach()  # [B,1,H,W]
-
+        return cam.detach()
 
 # ============================================================
 # 6) 설명맵 PNG 저장 (SCOUTER와 동일 폴더 규약)
