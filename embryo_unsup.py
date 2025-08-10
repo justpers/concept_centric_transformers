@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 pl.seed_everything(42, workers=True)
 from ctc.swin import SlotCSwinQSA, SlotCSwinISA, SlotCSwinSA
@@ -311,14 +311,17 @@ def main():
         quick_check(model, dm)
         return
     
+    ckpt = ModelCheckpoint(monitor="val_acc", mode="max", save_last=True, save_top_k=1)
+    es = EarlyStopping(monitor="val_loss", mode="min", patience=8)
+    
     trainer = pl.Trainer(max_epochs=args.epochs, devices=args.gpus, accelerator="gpu" if torch.cuda.is_available() else "cpu",
                          precision=16, log_every_n_steps=20,
                          default_root_dir="./checkpoints",
                          deterministic=True,
-                         callbacks=[LearningRateMonitor()]
+                         callbacks=[LearningRateMonitor(), ckpt, es]
                          )
     trainer.fit(model, datamodule=dm)
-    trainer.test(model, datamodule=dm)
+    trainer.test(model, datamodule=dm, ckpt_path=ckpt.best_model_path)
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
