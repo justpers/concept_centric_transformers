@@ -504,6 +504,7 @@ class ConceptCentricTransformerSwinQSA(nn.Module):
             self.unsup_concept_slot_attention = ConceptQuerySlotAttention(num_iterations=num_iterations,
                                                                           slot_size=embedding_dim,
                                                                           mlp_hidden_size=embedding_dim,
+                                                                          num_slots=n_unsup_concepts,
                                                                           )
             self.unsup_concept_slot_pos = nn.Parameter(torch.zeros(1, 1, n_unsup_concepts * embedding_dim),
                                                        requires_grad=True)
@@ -539,7 +540,9 @@ class ConceptCentricTransformerSwinQSA(nn.Module):
             nn.init.xavier_uniform_(self.spatial_concept_slots_init.weight)
             self.spatial_concept_slot_attention = ConceptQuerySlotAttention(num_iterations=num_iterations,
                                                                             slot_size=embedding_dim,
-                                                                            mlp_hidden_size=embedding_dim)
+                                                                            mlp_hidden_size=embedding_dim,
+                                                                            num_slots=n_spatial_concepts,
+                                                                            )
             self.spatial_concept_slot_pos = nn.Parameter(torch.zeros(1, 1, n_spatial_concepts * embedding_dim),
                                                          requires_grad=True)
             self.spatial_concept_tranformer = CrossAttention(
@@ -557,7 +560,7 @@ class ConceptCentricTransformerSwinQSA(nn.Module):
         if self.n_unsup_concepts > 0:  # unsupervised stream
             unsup_concepts, unsup_concepts_slot_attn = self.unsup_concept_slot_attention(x)
             unsup_concepts += self.unsup_concept_slot_pos.view(-1, self.n_unsup_concepts, self.embedding_dim)
-            out_unsup, unsup_concept_attn = self.concept_tranformer(x, unsup_concepts)
+            out_unsup, unsup_concept_attn = self.unsup_concept_tranformer(x, unsup_concepts)
             unsup_concept_attn = unsup_concept_attn.mean(1)  # average over heads
             out = out + out_unsup.mean(1)  # squeeze token dimension
 

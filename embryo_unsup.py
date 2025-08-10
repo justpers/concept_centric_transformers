@@ -1,32 +1,24 @@
-"""
-Embryo‐dataset fine‑tuning script (classification + *unsupervised* SlotCVIT QSA).
-
-* 개념 슬롯은 **비지도**로만 학습(n_unsup_concepts>0, n_concepts=n_spatial_concepts=0)
-* 분류 헤드는 성공/실패(2‑class) 지도 학습(CrossEntropy)
-* Loss = CE  +  λ_sparse·Sparsity  +  λ_div·Diversity ‑‑> _unsup_slot_losses 구현 참조
-
-Tested with torch 2.3 / pytorch‑lightning 1.9; modify paths & hyper‑params as needed.
-"""
-
 from __future__ import annotations
-import argparse, os, glob
-from typing import List, Tuple
-import warnings
+import argparse, os, glob, warnings, sys
+from dataclasses import dataclass
+from typing import List, Tuple, Literal, Dict, Type
+
 warnings.filterwarnings("ignore")
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch
-import sys
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import LearningRateMonitor
+from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
+pl.seed_everything(42, workers=True)
+from ctc.swin import SlotCSwinQSA, SlotCSwinISA, SlotCSwinSA
+from ctc.vit  import SlotCVITQSA, SlotCVITISA, SlotCVITSA
 import torchmetrics
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-torch.set_float32_matmul_precision('high')
 
-# ────────────────────────────────────────────────────────────
 # 1. Dataset & DataModule
-# ────────────────────────────────────────────────────────────
 class EmbryoDataset(Dataset):
     """Folder‑based: <root>/<split>/{failure|success}/*.png|jpg"""
     def __init__(self, root: str, split: str, transform: A.BasicTransform):
@@ -100,12 +92,47 @@ class EmbryoDataModule(pl.LightningDataModule):
         return DataLoader(self.test_ds, batch_size=self.hparams.batch_size, shuffle=False,
                           num_workers=self.hparams.num_workers, pin_memory=True)
 
+# 모델 설정
+@dataclass
+class CCTCfg:
+    backbone: Literal["swin_tiny", "swin_large", "vit_tiny", "vit_base"]
+    slot_type: Literal["qsa", "isa", "sa"] = "qsa"
+    model_name: str | None = None
+    num_classes: int = 2
+    n_unsup: int = 4
+    n_concepts: int = 0
+    n_spatial: int = 4
+    pretrained: bool = True
+    attn_drop: float = 0.1
+    proj_drop: float = 0.1
 
-# ────────────────────────────────────────────────────────────
-# 2. SlotCVIT ‑ LightningModule wrapper
-# ────────────────────────────────────────────────────────────
-from ctc.vit import SlotCVITQSA  # 원본 레포 코드 import
+_SWIN = {"qsa": SlotCSwinQSA, "isa": SlotCSwinISA, "sa": SlotCSwinSA}
+_VIT  = {"qsa": SlotCVITQSA,  "isa": SlotCVITISA,  "sa": SlotCVITSA}
 
+def build_cct(cfg: CCTCfg) -> nn.Module:
+    if cfg.backbone.startswith("swin"):
+        cls = _SWIN[cfg.slot_type]
+        default = {
+            "swin_tiny":  "swin_tiny_patch4_window7_224",
+            "swin_large": "swin_large_patch4_window7_224.ms_in22k",
+        }[cfg.backbone]
+    else:
+        cls = _VIT[cfg.slot_type]
+        default = {
+            "vit_tiny": "vit_tiny_patch16_224",
+            "vit_base": "vit_base_patch16_224",
+        }[cfg.backbone]
+    name = cfg.model_name or default
+    return cls(
+        model_name=name,
+        num_classes=cfg.num_classes,
+        n_unsup_concepts=cfg.n_unsup,
+        n_concepts=cfg.n_concepts,
+        n_spatial_concepts=cfg.n_spatial,
+        pretrained=cfg.pretrained,
+        attention_dropout=cfg.attn_drop,
+        projection_dropout=cfg.proj_drop,
+    )
 
 def _unsup_slot_losses(attn: torch.Tensor, lambda_sparse: float, lambda_div: float):
     """Re‑implementation (FP32) of sparsity & diversity losses used in QSA paper"""
@@ -132,30 +159,21 @@ def _unsup_slot_losses(attn: torch.Tensor, lambda_sparse: float, lambda_div: flo
     loss_div    = lambda_div * diversity
     return loss_sparse, loss_div, entropy
 
-
-class LitSlotCVIT(pl.LightningModule):
-    def __init__(self, lr: float = 1e-4, weight_decay: float = 0.05,
+class LitCCT(pl.LightningModule):
+    def __init__(self, cfg: CCTCfg, freeze_stages=0, warmup_epochs=3, lr: float = 1e-4, weight_decay: float = 0.05,
                  lambda_sparse: float = 1.0, lambda_div: float = 1.0,
                  n_unsup: int = 4):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["cfg"])
+        self.model = build_cct(cfg)
 
-        self.model = SlotCVITQSA(
-            model_name="vit_tiny_patch16_224",
-            num_classes=2,
-            n_unsup_concepts=n_unsup,
-            n_concepts=0,
-            n_spatial_concepts=4,
-            num_heads=12,
-            attention_dropout=0.1,
-            projection_dropout=0.1,
-        )
+        if freeze_stages:
+            self._freeze_encoder(freeze_stages)
 
         self.criterion = nn.CrossEntropyLoss()
         self.train_acc = torchmetrics.Accuracy(task="multiclass", num_classes=2)
         self.val_acc   = torchmetrics.Accuracy(task="multiclass", num_classes=2)
 
-    # ‑‑‑ Lightning hooks ‑‑‑
     def forward(self, x):
         return self.model(x)
 
@@ -192,16 +210,34 @@ class LitSlotCVIT(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
-        return [optimizer], [scheduler]
+        max_ep = self.trainer.max_epochs if self.trainer else 50
+        sched = {
+            "scheduler": LinearWarmupCosineAnnealingLR(
+                optimizer,
+                warmup_epochs=self.hparams.warmup_epochs,
+                max_epochs=max_ep,
+            ),
+            "interval": "epoch",
+            "frequency":1,
+        }
+        return {"optimizer":optimizer, "lr_scheduler":sched}
 
-# ────────────────────────────────────────────────────────────
-# 3. CLI
-# ────────────────────────────────────────────────────────────
+    def _freeze_encoder(self, k:int):
+        fe = self.model.feature_extractor
+        if k >= 1:
+            fe.patch_embed.requires_grad_(False)  # swin일 때 -> patch, ViT일 때 blocks
+        for i in range(1, k):
+            fe.layers[i-1].requires_grad_(False)
+        print(f"[Info] froze forse {k} stage")
+
+# 인자 설정
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Embryo SlotCVIT unsupervised concept fine‑tune")
-    p.add_argument("--root", type=str, default="./transfer", help="Dataset root path")
+    p = argparse.ArgumentParser(description="Embryo-CCT unsupervised concept fine‑tune")
+    p.add_argument("--root", type=str, default="./embryo", help="Dataset root path")
+    p.add_argument("--backbone", choices=["swin_tiny","swin_large","vit_tiny","vit_base"], default="swin_tiny")
+    p.add_argument("--slot_type", choices=["qsa","isa","sa"], default="qsa")
+    p.add_argument("--model_name")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--img_size", type=int, default=224)
@@ -213,6 +249,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--gpus", type=int, default=1)
     p.add_argument("--check_attn", action="store_true", help="CLS 어텐션 한 번만 찍고 종료")
+    p.add_argument("--warmup_epochs", type=int, default=3)
+    p.add_argument("--freeze_stages", type=int, default=1)
     return p.parse_args()
 
 def debug_hook(module, inputs, outputs):   # <─ 확인용 함수
@@ -235,9 +273,24 @@ def quick_check(model, dm):              # <─ 확인용 함수
 def main():
     args = parse_args()
 
-    dm = EmbryoDataModule(root=args.root, img_size=args.img_size, batch_size=args.batch_size, num_workers=args.num_workers)
-    model = LitSlotCVIT(lr=args.lr, weight_decay=args.weight_decay, lambda_sparse=args.lambda_sparse,
-                        lambda_div=args.lambda_div, n_unsup=args.n_unsup)
+    dm = EmbryoDataModule(root=args.root, 
+                          img_size=args.img_size, 
+                          batch_size=args.batch_size, 
+                          num_workers=args.num_workers)
+    cfg = CCTCfg(
+        backbone=args.backbone,
+        slot_type=args.slot_type,
+        model_name = args.model_name,
+        n_unsup = args.n_unsup,
+    )
+    model = LitCCT(cfg,
+                   lr=args.lr, 
+                   weight_decay=args.weight_decay, 
+                   lambda_sparse=args.lambda_sparse,
+                   lambda_div=args.lambda_div,
+                   freeze_stages=args.freeze_stages,
+                   warmup_epochs=args.warmup_epochs,
+                )
     
     #model.model.register_forward_hook(debug_hook)
     if args.check_attn:
@@ -247,10 +300,13 @@ def main():
     trainer = pl.Trainer(max_epochs=args.epochs, devices=args.gpus, accelerator="gpu" if torch.cuda.is_available() else "cpu",
                          precision=16, log_every_n_steps=20,
                          default_root_dir="./checkpoints",
+                         deterministic=True,
+                         callbacks=[LearningRateMonitor()]
                          )
     trainer.fit(model, datamodule=dm)
     trainer.test(model, datamodule=dm)
 
 if __name__ == "__main__":
+    torch.set_float32_matmul_precision('high')
     main()
     sys.exit()
