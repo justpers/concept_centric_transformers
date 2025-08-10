@@ -135,33 +135,33 @@ def build_cct(cfg: CCTCfg) -> nn.Module:
     )
 
 def _unsup_slot_losses(attn: torch.Tensor, lambda_sparse: float, lambda_div: float):
-    """Re‑implementation (FP32) of sparsity & diversity losses used in QSA paper"""
     if attn is None or (lambda_sparse == 0 and lambda_div == 0):
         zero = torch.tensor(0., device=attn.device if attn is not None else "cpu")
         return zero, zero, zero
 
-    # attn: [B, C, N] 
-    # (A) 토큰 축(N) 정규화
-    if attn.size(1) == 1 and attn.size(2) > 1:  # safety transpose
+    # attn: [B,C,N] 또는 [B,N,C] -> [B,C,N]
+    if attn.dim() == 2:  # safety
+        attn = attn.unsqueeze(1)
+    if attn.size(1) != attn.size(-1) and attn.size(1) not in (1, 2, 3, 4, 8, 16, 32):  # 대략적인 체크
         attn = attn.transpose(1, 2)
+    B, C, N = attn.shape
 
-    p = attn.float().clamp_min(1e-8)  # [B,C,N]
-    p = p / (p.sum(dim=-1, keepdim=True) + 1e-8)
+    eps = 1e-12
+    # 토큰 방향 확률화: 각 슬롯 맵이 토큰 축으로 합=1 되도록
+    p = attn.float().clamp_min(eps)
+    p = p / (p.sum(dim=-1, keepdim=True) + eps)                # [B,C,N]
 
-    B, C, N = p.shape
+    # (1) Sparsity: 슬롯별 토큰 분포 엔트로피 (0=스파스, 1=균일)
+    entropy = -(p * (p + eps).log()).sum(dim=-1)               # [B,C]
+    entropy_norm = entropy / torch.log(torch.tensor(float(N), device=p.device))
+    sparsity = entropy_norm.mean()                              # scalar ∈ [0,1]
 
-    # # (B) sparsity = 정규화된 엔트로피 / ln(N)  → [0,1]
-    entropy = -(p * p.log()).sum(-1).mean()         
-    sparsity = entropy / torch.log(torch.tensor(float(N), device=p.device))
+    # (2) Diversity: 슬롯 간 직교 유도 (토큰 차원 Gram, 단위행렬과 차이)
+    G = torch.matmul(p, p.transpose(1, 2)) / float(N)          # [B,C,C]
+    I = torch.eye(C, device=p.device).unsqueeze(0)              # [1,C,C]
+    diversity = ((G - I) ** 2).mean()                           # off-diagonal도 포함
 
-    # (C) diversity = 슬롯간 유사도(토큰 분포 dot) 평균
-    sim = torch.einsum('bcn,bdn->bcd', p, p)
-    offdiag = sim - torch.diag_embed(sim.diagonal(dim1=1, dim2=2))
-    diversity = offdiag.sum() / (B * C * (C - 1) + 1e-8)
-
-    loss_sparse = lambda_sparse * sparsity
-    loss_div    = lambda_div * diversity
-    return loss_sparse, loss_div, entropy
+    return lambda_sparse * sparsity, lambda_div * diversity, entropy_norm.mean()
 
 class LitCCT(pl.LightningModule):
     def __init__(self, cfg: CCTCfg, freeze_stages=0, warmup_epochs=3, lr: float = 1e-4, weight_decay: float = 0.05,
