@@ -6,6 +6,7 @@ from .swin import cub_slotcswin_sa, cub_slotcswin_isa, cub_slotcswin_qsa
 from .convnext import cub_slotc_convnext_sa, cub_slotc_convnext_isa, cub_slotc_convnext_qsa
 from .ctc_model import CTCModel, load_exp, run_exp
 from .vit import embryo_slotcvit_sa
+from .cct_builder import build_model
 
 __all__ = [
     # basic modules to execute models.
@@ -45,4 +46,5 @@ __all__ = [
 
     # embryo
     "embryo_slotcvit_sa",
+    "build_model"
 ]
