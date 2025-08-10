@@ -7,11 +7,11 @@ warnings.filterwarnings("ignore")
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch
-torch.backends.cudnn.benchmark = False
-torch.use_deterministic_algorithms(True, warn_only=True)
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import LearningRateMonitor
+from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 pl.seed_everything(42, workers=True)
 from ctc.swin import SlotCSwinQSA, SlotCSwinISA, SlotCSwinSA
 from ctc.vit  import SlotCVITQSA, SlotCVITISA, SlotCVITSA
@@ -160,12 +160,16 @@ def _unsup_slot_losses(attn: torch.Tensor, lambda_sparse: float, lambda_div: flo
     return loss_sparse, loss_div, entropy
 
 class LitCCT(pl.LightningModule):
-    def __init__(self, cfg: CCTCfg, lr: float = 1e-4, weight_decay: float = 0.05,
+    def __init__(self, cfg: CCTCfg, freeze_stages=0, warmup_epochs=3, lr: float = 1e-4, weight_decay: float = 0.05,
                  lambda_sparse: float = 1.0, lambda_div: float = 1.0,
                  n_unsup: int = 4):
         super().__init__()
         self.save_hyperparameters(ignore=["cfg"])
         self.model = build_cct(cfg)
+
+        if freeze_stages:
+            self._freeze_encoder(freeze_stages)
+
         self.criterion = nn.CrossEntropyLoss()
         self.train_acc = torchmetrics.Accuracy(task="multiclass", num_classes=2)
         self.val_acc   = torchmetrics.Accuracy(task="multiclass", num_classes=2)
@@ -206,8 +210,25 @@ class LitCCT(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
-        return [optimizer], [scheduler]
+        max_ep = self.trainer.max_epochs if self.trainer else 50
+        sched = {
+            "scheduler": LinearWarmupCosineAnnealingLR(
+                optimizer,
+                warmup_epochs=self.hparams.warmup_epochs,
+                max_epochs=max_ep,
+            ),
+            "interval": "epoch",
+            "frequency":1,
+        }
+        return {"optimizer":optimizer, "lr_scheduler":sched}
+
+    def _freeze_encoder(self, k:int):
+        fe = self.model.feature_extractor
+        if k >= 1:
+            fe.patch_embed.requires_grad_(False)  # swin일 때 -> patch, ViT일 때 blocks
+        for i in range(1, k):
+            fe.layers[i-1].requires_grad_(False)
+        print(f"[Info] froze forse {k} stage")
 
 # 인자 설정
 
@@ -228,6 +249,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--gpus", type=int, default=1)
     p.add_argument("--check_attn", action="store_true", help="CLS 어텐션 한 번만 찍고 종료")
+    p.add_argument("--warmup_epochs", type=int, default=3)
+    p.add_argument("--freeze_stages", type=int, default=1)
     return p.parse_args()
 
 def debug_hook(module, inputs, outputs):   # <─ 확인용 함수
@@ -264,7 +287,9 @@ def main():
                    lr=args.lr, 
                    weight_decay=args.weight_decay, 
                    lambda_sparse=args.lambda_sparse,
-                   lambda_div=args.lambda_div
+                   lambda_div=args.lambda_div,
+                   freeze_stages=args.freeze_stages,
+                   warmup_epochs=args.warmup_epochs,
                 )
     
     #model.model.register_forward_hook(debug_hook)
@@ -275,7 +300,8 @@ def main():
     trainer = pl.Trainer(max_epochs=args.epochs, devices=args.gpus, accelerator="gpu" if torch.cuda.is_available() else "cpu",
                          precision=16, log_every_n_steps=20,
                          default_root_dir="./checkpoints",
-                         deterministic=True
+                         deterministic=True,
+                         callbacks=[LearningRateMonitor()]
                          )
     trainer.fit(model, datamodule=dm)
     trainer.test(model, datamodule=dm)
