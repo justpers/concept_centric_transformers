@@ -189,7 +189,14 @@ class LitCCT(pl.LightningModule):
         sp_loss, div_loss, _ = _unsup_slot_losses(
             unsup_attn, self.hparams.lambda_sparse, self.hparams.lambda_div
         )
-        loss = ce_loss + sp_loss + div_loss
+
+        scale = 1.0
+        if stage == "train":
+            wup = getattr(self.hparams, "warmup_epochs", 0)
+            if wup and wup > 0:
+                scale = min(1.0, (self.current_epoch + 1) / float(wup))
+
+        loss = ce_loss + scale * (sp_loss + div_loss)
 
         preds = logits.argmax(dim=1)
         acc = self.train_acc(preds, labels) if stage == "train" else self.val_acc(preds, labels)
@@ -200,6 +207,9 @@ class LitCCT(pl.LightningModule):
         self.log(f"{stage}_div_loss", div_loss, prog_bar=True)
 
         if stage == "train":
+            self.log("lambda_scale", scale, prog_bar=True)                 # 램프 스케일 확인용
+            self.log("train_sp_loss_scaled", sp_loss * scale, prog_bar=False)
+            self.log("train_div_loss_scaled", div_loss * scale, prog_bar=False)
             self.log("loss_ce", ce_loss, prog_bar=False)
         return loss
 
