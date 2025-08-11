@@ -143,20 +143,19 @@ def load_cct_model(args, device):
 # 4) CCT → 확률 출력 래퍼 (metrics 가 기대하는 인터페이스)
 # ============================================================
 class CCTModelWrapper(torch.nn.Module):
-    def __init__(self, cct_model: torch.nn.Module):
+    def __init__(self, cct_model: torch.nn.Module, input_size=(224, 224)):
         super().__init__()
         self.cct = cct_model
+        # Grad-CAM explainer 연결 (입력 해상도에 맞게)
+        self.explainer = CCTExplainer(self.cct, input_size=input_size)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, softmax: bool = False, **kwargs) -> torch.Tensor:
-        out = self.cct(x)
-        # CCT forward 가 (logits, unsup, concept, spatial_concept) 형태라고 가정
-        if isinstance(out, (tuple, list)) and len(out) >= 1:
-            logits = out[0]
-        else:
-            logits = out
-        probs = F.softmax(logits, dim=1)
-        return probs
+        # kwargs (예: sens=...)를 내부 모델로 그대로 전달
+        out = self.cct(x, **kwargs)
+        # CCT는 (logits, unsup, concept, spatial_concept) 형태이므로 첫 항을 logits으로 사용
+        logits = out[0] if isinstance(out, (tuple, list)) and len(out) >= 1 else out
+        return F.softmax(logits, dim=1) if softmax else logits
 
 # ============================================================
 # 5) CCT 설명맵 (Grad-CAM: Swin feature_extractor.norm 대상)
@@ -333,7 +332,7 @@ def main():
     # 1) 데이터 & 모델
     val_loader = get_val_loader(args)
     cct = load_cct_model(args, device)
-    model = CCTModelWrapper(cct).to(device)  # metrics가 기대하는 (B,C) 확률 출력을 보장
+    model = CCTModelWrapper(cct, input_size=(args.img_size, args.img_size)).to(device)  # metrics가 기대하는 (B,C) 확률 출력을 보장
 
     # 2) 설명맵 생성 (IAUC/DAUC·Infidelity/Sensitivity·area-size 모두 선행 필요)
     if args.auc or args.saliency or args.area_prec:
