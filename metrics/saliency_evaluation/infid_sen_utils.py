@@ -168,6 +168,8 @@ def get_exp_sens(X, model, expl, yy, sen_r, sen_N, norm):
     sen_N : 샘플 횟수
     norm  : ||expl|| 등 정규화 상수
     """
+    if X.ndim ==3:
+        X = X.unsqueeze(0)
     assert X.ndim == 4 and X.size(0) == 1, "X는 [1,3,H,W]여야 합니다."
     device = X.device
     H, W = X.shape[-2], X.shape[-1]
