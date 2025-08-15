@@ -160,52 +160,68 @@ def get_exp_infid(image, model, exp, label, pdt, binary_I, pert):
 # ------------------------------------------------------------
 def get_exp_sens(X, model, expl, yy, sen_r, sen_N, norm):
     """
-    X     : torch.Tensor [1,3,H,W]
-    model : CCTModelWrapper(softmax 지원). 가능하면 model.explainer(CCTExplainer) 존재
-    expl  : 원본 설명맵(np.ndarray or torch.Tensor). 크기는 임의(H',W')
-    yy    : 정답(또는 타겟) 클래스 (tensor scalar)
-    sen_r : 노이즈 반경
+    Sensitivity = max_{||ε||<=r} ||Φ(x+ε) - Φ(x)|| / ||Φ(x)||
+    여기서는 PNG가 아닌 explainer로 clean/noisy 설명맵을 직접 생성합니다.
+    X  : [3,H,W] 또는 [1,3,H,W] (torch.Tensor, 정규화 완료)
+    model.explainer : CCTExplainer 가 연결되어 있어야 함 (eval_blasto_cct.py에서 이미 연결함)
+    yy : 타깃 클래스 (tensor scalar)
+    sen_r : 노이즈 범위
     sen_N : 샘플 횟수
-    norm  : ||expl|| 등 정규화 상수
+    norm 파라미터는 유지하지만, 실제로는 여기서 clean 맵으로 다시 계산합니다.
     """
-    if X.ndim ==3:
-      X = X.unsqueeze(0)
+    # 0) 배치 차원 보장
+    if X.ndim == 3:
+        X = X.unsqueeze(0)
     assert X.ndim == 4 and X.size(0) == 1, "X는 [1,3,H,W]여야 합니다."
     device = X.device
     H, W = X.shape[-2], X.shape[-1]
-
-    # 원본 설명맵을 (H,W)로 정규화/리사이즈
-    if isinstance(expl, torch.Tensor):
-        expl_ref = _resize_map_torch(expl, H, W)
-    else:
-        expl_ref = _resize_map_np(np.asarray(expl), H, W)  # uint8 [H,W]
-
-    max_diff = -math.inf
     cls_idx = int(yy.item())
 
+    # 1) 기준(깨끗한 X)의 설명맵을 explainer로 생성 (0..1) → uint8 [H,W]
+    if hasattr(model, "explainer") and model.explainer is not None:
+        with torch.enable_grad():
+            sal_clean = model.explainer.saliency(X, cls_idx)     # [1,1,H,W], 0..1
+        expl_ref = _resize_map_torch(sal_clean[0,0], H, W)        # uint8 [H,W]
+    else:
+        # 폴백: 주어진 expl(보통 PNG)을 리사이즈
+        if isinstance(expl, torch.Tensor):
+            expl_ref = _resize_map_torch(expl, H, W)
+        else:
+            expl_ref = _resize_map_np(np.asarray(expl), H, W)
+
+    ref_norm = float(np.linalg.norm(expl_ref.astype(np.float32)))
+    if ref_norm < 1e-6:
+        # 완전 검정/거의 0 맵 → 폭주 방지 (스킵하거나 0 반환)
+        return 0.0
+
+    max_diff = -float("inf")
     for _ in range(sen_N):
-        # 1) 작은 입력 섭동
-        eps_np = sample_eps_Inf(X.detach().cpu().numpy(), sen_r, 1)      # (1,3,H,W)
+        # 2) 작은 섭동 샘플
+        eps_np = sample_eps_Inf(X.detach().cpu().numpy(), sen_r, 1)
         sample = torch.from_numpy(eps_np).to(device=device, dtype=X.dtype)
         X_noisy = X + sample
 
-        # 2) 노이즈 입력에 대한 설명맵
+        # 3) noisy 설명맵을 explainer로 생성
         if hasattr(model, "explainer") and model.explainer is not None:
             with torch.enable_grad():
-                sal = model.explainer.saliency(X_noisy, cls_idx)         # [1,1,H,W], 0..1
-            expl_eps = _resize_map_torch(sal[0, 0], H, W)                 # uint8 [H,W]
+                sal_noisy = model.explainer.saliency(X_noisy, cls_idx)   # [1,1,H,W]
+            expl_eps = _resize_map_torch(sal_noisy[0,0], H, W)           # uint8 [H,W]
         else:
-            _ = model(X_noisy, sens=cls_idx)  # side-effect 기대(가능하면 explainer 경로 사용 권장)
+            # 폴백: SCOUTER 방식
+            _ = model(X_noisy, sens=cls_idx)  # side effect 가정
             expl_eps = np.array(
                 Image.open("noisy.png").resize((W, H), resample=Image.BILINEAR),
                 dtype=np.uint8
             )
 
-        # 3) 차이 계산 (L2)
-        diff = np.linalg.norm(expl_ref.astype(np.float32) - expl_eps.astype(np.float32))
-        max_diff = max(max_diff, diff)
+        # 4) L2 차이 & 최대값 갱신
+        diff = float(np.linalg.norm(
+            expl_ref.astype(np.float32) - expl_eps.astype(np.float32)
+        ))
+        if diff > max_diff:
+            max_diff = diff
 
-    return float(max_diff / (float(norm) + 1e-12))
+    return float(max_diff / (ref_norm + 1e-12))
 
 # ------------------------------------------------------------
 # Driver
@@ -234,28 +250,31 @@ def evaluate_infid_sen(loader, model,
                                  device=y_all.device)
 
         for img, yy, fname in zip(X_all, y_all, names):
-            H, W = img.shape[-2], img.shape[-1]
-
-            # ① 현재 입력에 대한 타깃 클래스 점수(로짓/확률 일관)
+            # ----- (1) 예측 확률 p(x)[y] -----
             with torch.no_grad():
-                pdt_val = model(img.unsqueeze(0))[:, int(yy.item())].cpu().numpy()  # shape (1,)
+                pdt_val = model(img.unsqueeze(0))[:, yy].cpu().numpy()  # shape (1,)
 
-            # ② 대응 saliency 파일 읽기 (★ 입력 해상도 (W,H)로 리사이즈)
+            # ----- (2) Infidelity: PNG 설명맵 사용 (기존 유지) -----
             base_id = os.path.basename(fname)
-            expl = np.array(
-                Image.open(os.path.join(exp_path, base_id))
-                     .resize((W, H), resample=Image.BILINEAR),
+            ex_png = os.path.join(exp_path, base_id)  # generate_exps_cct가 만든 PNG
+            if not os.path.isfile(ex_png):
+                # 히트맵 누락 시 이 샘플은 스킵
+                # print(f"[warn] missing heatmap: {ex_png}")
+                continue
+
+            expl_png = np.array(
+                Image.open(ex_png),
                 dtype=np.uint8
             )
-            norm = np.linalg.norm(expl)
-
-            # ③ Infidelity / Sensitivity
-            infid = get_exp_infid(img, model, expl, yy, pdt_val,
+            # 원 함수는 내부에서 260 고정 리사이즈 등을 처리하므로 여기선 그대로 전달
+            infid = get_exp_infid(img, model, expl_png, yy, pdt_val,
                                   binary_I=binary_I, pert=pert)
-            sens  = get_exp_sens(img, model, expl, yy,
-                                 sen_r, sen_N, norm)
-
             infids.append(infid)
+
+            # ----- (3) Sensitivity: explainer로 clean/noisy 모두 생성 -----
+            # norm 인자는 사용하지 않지만 시그니처 유지 위해 값을 넣습니다.
+            sens  = get_exp_sens(img, model, expl_png, yy, sen_r, sen_N, norm=0.0)
             max_sens.append(sens)
 
-    return float(np.mean(infids)), float(np.mean(max_sens))
+    # 평균 반환
+    return float(np.mean(infids)) if infids else 0.0, float(np.mean(max_sens)) if max_sens else 0.0
