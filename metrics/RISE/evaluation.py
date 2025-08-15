@@ -223,23 +223,39 @@ class CausalMetric:
         """
         assert img_batch.ndim == 4 and img_batch.size(1) == 3, "img_batch must be [B,3,H,W]"
         device = img_batch.device
-        B, _, H, W = img_batch.shape
+        B_img, _, H, W = img_batch.shape
+
+        # normalize exp_batch shape and move to device
+        exp_t = _ensure_tensor(exp_batch).float().to(device)
+        if exp_t.ndim == 4:
+            # [B',C',H',W'] -> 채널 평균으로 단일 채널
+            if exp_t.size(1) > 1:
+                exp_t = exp_t.mean(dim=1, keepdim=True)          # [B',1,H',W']
+        elif exp_t.ndim == 3:
+            exp_t = exp_t.unsqueeze(1)                            # [B',1,H',W']
+        elif exp_t.ndim == 2:
+            # [H',W'] → 일단 이미지 배치 크기로 브로드캐스트
+            exp_t = exp_t.unsqueeze(0).unsqueeze(0).expand(B_img, 1, -1, -1)  # [B_img,1,H',W']
+        else:
+            raise ValueError(f"Unexpected exp_batch ndim={exp_t.ndim}")
+
+        # 배치 수 정렬: N = min(B_img, B_exp)
+        B_exp = exp_t.size(0)
+        if B_exp != B_img:
+            N = min(B_img, B_exp)
+            img_batch = img_batch[:N]
+            exp_t     = exp_t[:N]
+            B = N
+            H, W = img_batch.shape[-2], img_batch.shape[-1]
+        else:
+            B = B_img
+
         HW = H * W
         n_steps = (HW + self.step - 1) // self.step
 
-        # 1) normalize exp_batch shape and resize to (H,W)
-        exp_t = _ensure_tensor(exp_batch).float().to(device)
-        if exp_t.ndim == 4:
-            if exp_t.size(1) > 1:
-                exp_t = exp_t.mean(dim=1, keepdim=True)  # [B,1,H',W']
-        elif exp_t.ndim == 3:
-            exp_t = exp_t.unsqueeze(1)                    # [B,1,H',W']
-        else:
-            # [H',W'] → broadcast to batch
-            exp_t = exp_t.unsqueeze(0).unsqueeze(0).expand(B, 1, -1, -1)  # [B,1,H',W']
-
+        # 3) 설명맵을 이미지 해상도(H,W)로 리사이즈 + 평탄화
         exp_resized = F.interpolate(exp_t, size=(H, W), mode="bilinear", align_corners=False)  # [B,1,H,W]
-        exp_flat = exp_resized.view(B, -1)  # [B, HW]
+        exp_flat    = exp_resized.view(B, -1)                                         
         salient_order = torch.argsort(exp_flat, dim=1, descending=True).detach().cpu().numpy()  # [B, HW]
 
         # 2) determine top-1 class per image (once)

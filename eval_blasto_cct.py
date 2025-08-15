@@ -321,6 +321,22 @@ def area_size_only(subdir: str):
             pass
     return (sum(sizes) / len(sizes)) if sizes else None
 
+# 파일 이름 기준으로 경로 매칭
+def get_aligned_exp_list(val_loader, exp_root: str):
+    files = []
+    missing = 0
+    for batch in val_loader:
+        for path in batch["names"]:
+            base = os.path.splitext(os.path.basename(path))[0]
+            p = os.path.join(exp_root, base + ".png")
+            if os.path.exists(p):
+                files.append(p)
+            else:
+                missing += 1
+                # print(f"[warn] missing exp: {p}")
+    if missing:
+        print(f"[warn] {missing} heatmaps missing; they will be skipped.")
+    return files
 
 # ============================================================
 # 8) main
@@ -344,7 +360,7 @@ def main():
 
     # 3) IAUC / DAUC
     if args.auc:
-        files = exp_data.get_exp_filenames(exp_root)
+        files = get_aligned_exp_list(val_loader, exp_root)
         exp_loader = torch.utils.data.DataLoader(
             exp_data.ExpData(files, args.img_size, resize=True),
             batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
