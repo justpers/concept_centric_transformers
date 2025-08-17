@@ -1,11 +1,11 @@
 from __future__ import annotations
-from embryo_unsup import CCTCfg, LitCCT  # ← 경로는 레포 구조에 맞게 조정
 
 def build_model(args):
     """
     평가용 CCT 빌더: 학습과 동일한 설정으로 LitCCT를 만들어 반환.
     eval_blasto_cct.py의 --model_entry 에서 이 함수를 호출합니다.
     """
+    from embryo_unsup import CCTCfg, LitCCT 
     # 평가 시에도 학습 때와 '동일'한 하이퍼파라미터가 필요합니다.
     # (백본/슬롯타입/컨셉 수/unsup 슬롯 수 등)
     cfg = CCTCfg(
