@@ -3,6 +3,7 @@ from PIL import Image
 import matplotlib.cm as cm
 from embryo_unsup import LitCCT, EmbryoDataModule, CCTCfg
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+import argparse, os
 
 # ───────────────────────────── 헬퍼 ──────────────────────────────
 def to_rgb(img_t, mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD):
@@ -47,7 +48,7 @@ def main(
     os.makedirs(out_dir, exist_ok=True)
 
     # 1) datamodule
-    dm = EmbryoDataModule(root="./embryo", img_size=img_size,
+    dm = EmbryoDataModule(root="./kromp", img_size=img_size,
                           batch_size=16, num_workers=4)
     dm.setup("test")
 
@@ -108,4 +109,24 @@ def main(
 
 # ──────────────────────────── 실행 ─────────────────────────────
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--ckpt_path", type=str,
+                   default="checkpoints/lightning_logs/version_1/checkpoints/epoch=39-step=1440.ckpt")
+    p.add_argument("--out_dir", type=str, default="vis_slots")
+    p.add_argument("--n_unsup", type=int, default=4)
+    p.add_argument("--img_size", type=int, default=224)
+    p.add_argument("--top_k", type=int, default=30)
+    p.add_argument("--thres", type=float, default=0.6)
+    args = p.parse_args()
+
+    # (선택) 경로 확인 메시지
+    print("ckpt_path =", os.path.abspath(args.ckpt_path))
+
+    main(
+        ckpt_path=args.ckpt_path,
+        out_dir=args.out_dir,
+        n_unsup=args.n_unsup,
+        img_size=args.img_size,
+        top_k=args.top_k,
+        thres=args.thres,
+    )
